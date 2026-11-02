@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#153a32">
+  <title>PDV — Ponto de venda</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <main id="authView" class="auth-wrap">
+    <section class="auth-card">
+      <div class="brand-mark">P</div>
+      <p class="eyebrow">GESTÃO DE VENDAS</p>
+      <h1 id="authTitle">PDV</h1>
+      <p id="authDescription" class="muted">Entre para acessar o ponto de venda.</p>
+      <form id="loginForm" class="stack">
+        <label>Usuário<input name="username" autocomplete="username" required maxlength="50"></label>
+        <label>Senha<input name="password" type="password" autocomplete="current-password" required maxlength="200"></label>
+        <button class="button primary" type="submit">Entrar</button>
+      </form>
+      <form id="setupForm" class="stack hidden">
+        <label>Seu nome<input name="name" autocomplete="name" required maxlength="100"></label>
+        <label>Nome da loja/unidade<input name="branchName" value="Unidade principal" required maxlength="100"></label>
+        <label>Usuário administrador<input name="username" autocomplete="username" required maxlength="50"></label>
+        <label>Crie uma senha forte<input name="password" type="password" autocomplete="new-password" minlength="12" required maxlength="200"></label>
+        <p class="hint">Use pelo menos 12 caracteres. Não existe senha padrão.</p>
+        <button class="button primary" type="submit">Criar loja e administrador</button>
+      </form>
+    </section>
+  </main>
+
+  <div id="appView" class="app-shell hidden">
+    <aside class="sidebar">
+      <a class="brand" href="#" aria-label="PDV início"><span class="brand-mark small">P</span><span>ponto<span class="brand-light">certo</span></span></a>
+      <p class="nav-caption">OPERAÇÃO</p>
+      <nav id="mainNav" class="nav-list" aria-label="Menu principal">
+        <button class="nav-link active" data-view="sales"><span>▣</span> Vendas</button>
+        <button class="nav-link" data-view="products"><span>□</span> Produtos e estoque</button>
+        <button class="nav-link manager-only" data-view="promotions"><span>%</span> Promoções</button>
+        <button class="nav-link" data-view="labels"><span>▥</span> Etiquetas</button>
+        <button class="nav-link" data-view="customers"><span>♙</span> Clientes</button>
+        <button class="nav-link" data-view="cash"><span>◷</span> Caixa</button>
+        <button class="nav-link manager-only" data-view="reports"><span>▤</span> Relatórios</button>
+        <button class="nav-link admin-only" data-view="settings"><span>⚙</span> Administração</button>
+      </nav>
+      <div class="sidebar-bottom">
+        <div class="connection"><span class="status-dot"></span><span>Banco conectado</span></div>
+        <p class="small muted">Seus dados ficam salvos no servidor.</p>
+      </div>
+    </aside>
+
+    <div class="main-column">
+      <header class="topbar">
+        <div>
+          <label class="branch-label" for="branchSelect">UNIDADE</label>
+          <select id="branchSelect" aria-label="Selecionar unidade"></select>
+        </div>
+        <div class="account">
+          <div class="avatar" id="userAvatar">U</div>
+          <div class="account-copy"><strong id="userName"></strong><span id="userRole"></span></div>
+          <button id="passwordButton" class="button ghost small-button" type="button">Senha</button>
+          <button id="logoutButton" class="button ghost small-button" type="button">Sair</button>
+        </div>
+      </header>
+
+      <main id="content" class="content">
+        <section id="view-sales" class="view"></section>
+        <section id="view-products" class="view hidden"></section>
+        <section id="view-promotions" class="view hidden"></section>
+        <section id="view-labels" class="view hidden"></section>
+        <section id="view-customers" class="view hidden"></section>
+        <section id="view-cash" class="view hidden"></section>
+        <section id="view-reports" class="view hidden"></section>
+        <section id="view-settings" class="view hidden"></section>
+      </main>
+    </div>
+  </div>
+  <div id="printRoot" class="print-root"></div>
+  <dialog id="salesHistoryDialog" class="sales-history-dialog">
+    <div class="sales-history-heading">
+      <div><p class="eyebrow">OPERAÇÃO</p><h2>Histórico de vendas</h2></div>
+      <button id="closeSalesHistory" class="button ghost small-button" type="button" aria-label="Fechar histórico">Fechar</button>
+    </div>
+    <p id="salesHistoryNotice" class="hint"></p>
+    <div id="salesHistoryBody"></div>
+  </dialog>
+  <dialog id="paymentDialog" class="payment-dialog">
+    <div id="paymentDialogContent"></div>
+  </dialog>
+  <dialog id="passwordDialog" class="password-dialog">
+    <form id="passwordForm" class="stack">
+      <div class="dialog-heading"><div><p class="eyebrow">SEGURANÇA</p><h2>Alterar senha</h2></div><button id="closePasswordDialog" class="button ghost small-button" type="button" aria-label="Fechar">×</button></div>
+      <label>Senha atual<input name="currentPassword" type="password" autocomplete="current-password" required maxlength="200"></label>
+      <label>Nova senha<input name="newPassword" type="password" autocomplete="new-password" minlength="12" required maxlength="200"></label>
+      <label>Confirme a nova senha<input name="confirmPassword" type="password" autocomplete="new-password" minlength="12" required maxlength="200"></label>
+      <div class="form-actions"><button class="button primary" type="submit">Atualizar senha</button></div>
+    </form>
+  </dialog>
+  <dialog id="transferDialog" class="password-dialog">
+    <form id="transferForm" class="stack">
+      <div class="dialog-heading"><div><p class="eyebrow">ESTOQUE</p><h2>Transferir produto</h2></div><button id="closeTransferDialog" class="button ghost small-button" type="button" aria-label="Fechar">×</button></div>
+      <input name="productId" type="hidden">
+      <p id="transferProductName" class="muted"></p>
+      <label>Unidade de destino<select name="targetBranchId" required></select></label>
+      <label>Quantidade<input name="quantity" type="number" min="1" step="1" required></label>
+      <label>Motivo/observação<input name="note" maxlength="200" required></label>
+      <div class="form-actions"><button class="button primary" type="submit">Confirmar transferência</button></div>
+    </form>
+  </dialog>
+</body>
+</html>
