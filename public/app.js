@@ -16,7 +16,9 @@ const state = {
   lastAutoAddedCode: null,
   productImageData: undefined,
   productImagesData: [],
+  productImagesPromise: Promise.resolve([]),
   productImageDirty: false,
+  productColorRows: [],
   view: "sales",
   toastTimer: null,
   skipTestQrOnce: false,
@@ -81,6 +83,43 @@ function showToast(message, isError = false) {
   toast.classList.add("show");
   clearTimeout(state.toastTimer);
   state.toastTimer = setTimeout(() => toast.classList.remove("show"), 3600);
+}
+
+function requestText(title, label, { value = "", placeholder = "", maxLength = 200, inputMode = "text" } = {}) {
+  const dialog = $("#inputDialog");
+  const form = $("#inputDialogForm");
+  const input = $("#inputDialogValue");
+  $("#inputDialogTitle").textContent = title;
+  $("#inputDialogLabel").textContent = label;
+  input.value = value;
+  input.placeholder = placeholder;
+  input.maxLength = maxLength;
+  input.inputMode = inputMode;
+
+  return new Promise((resolve) => {
+    const cleanup = () => {
+      dialog.removeEventListener("close", onClose);
+      form.removeEventListener("submit", onSubmit);
+      $("#cancelInputDialog").removeEventListener("click", onCancel);
+      $("#closeInputDialog").removeEventListener("click", onCancel);
+    };
+    const finish = (result) => {
+      cleanup();
+      resolve(result);
+    };
+    const onClose = () => finish(dialog.returnValue === "confirm" ? input.value : null);
+    const onSubmit = (event) => {
+      event.preventDefault();
+      dialog.close("confirm");
+    };
+    const onCancel = () => dialog.close();
+    dialog.addEventListener("close", onClose, { once: true });
+    form.addEventListener("submit", onSubmit);
+    $("#cancelInputDialog").addEventListener("click", onCancel);
+    $("#closeInputDialog").addEventListener("click", onCancel);
+    dialog.showModal();
+    input.focus();
+  });
 }
 
 async function api(path, options = {}) {
@@ -156,7 +195,14 @@ async function enterApplication(session) {
   await loadView("sales");
 }
 
-function switchView(view) {
+async function switchView(view) {
+  if (view === "sales") {
+    const cash = await api(`/api/cash?branchId=${state.branchId}`);
+    if (!cash.open) {
+      view = "cash";
+      showToast("Abra o caixa desta unidade antes de acessar as vendas.");
+    }
+  }
   state.view = view;
   $("#appView").classList.toggle("sales-active", view === "sales");
   $$(".nav-link").forEach((button) => button.classList.toggle("active", button.dataset.view === view));
@@ -257,34 +303,192 @@ async function renderSales() {
 
 function renderProductTiles(products) {
   if (!products.length) return `<div class="empty">Nenhum produto encontrado. Cadastre produtos em Produtos e estoque.</div>`;
-  return products.map((product) => `
-    <button class="product-tile ${state.searchMatchProductId === product.id ? "is-search-match" : ""}" type="button" data-action="add-product" data-id="${product.id}" aria-pressed="${state.selectedProductId === product.id}" ${product.quantity < 1 ? "disabled" : ""}>
+  return products.flatMap((product) => (product.variants?.length ? product.variants : [null]).map((variant) => {
+    const stock = variant ? variant.quantity : product.quantity;
+    return `
+    <button class="product-tile ${state.searchMatchProductId === product.id ? "is-search-match" : ""}" type="button" data-action="add-product" data-id="${product.id}" ${variant ? `data-variant-id="${variant.id}"` : ""} aria-pressed="${state.selectedProductId === product.id}" ${stock < 1 ? "disabled" : ""}>
       ${productImage(product)}
-      <span class="product-tile-copy"><strong>${escapeHtml(product.name)}</strong>
+      <span class="product-tile-copy"><strong>${escapeHtml(product.name)}${variant?.color ? ` · ${escapeHtml(variant.color)}` : ""}${variant?.size ? ` · Tam. ${escapeHtml(variant.size)}` : ""}</strong>
       ${product.promo_discount_basis_points ? `<span class="product-old-price">${formatMoney(product.regular_price_cents)}</span>` : ""}
       <span class="product-price">${formatMoney(product.price_cents)}</span>
       ${product.promo_discount_basis_points ? `<small class="product-promo-badge">${(product.promo_discount_basis_points / 100).toFixed(2)}% OFF</small>` : ""}
-      <small>${product.quantity} em estoque · ${escapeHtml(product.sku)}</small></span>
-    </button>`).join("");
+      <small>${stock} em estoque · ${escapeHtml(variant?.sku ?? product.sku)}</small></span>
+    </button>`;
+  })).join("");
 }
 
 function renderCartRows() {
   if (!state.cart.length) return `<div class="empty">Sua venda está vazia.<br>Selecione um produto para começar.</div>`;
   return state.cart.map((item) => `
     <div class="cart-row ${state.selectedProductId === item.id ? "is-selected" : ""}">
-      <strong>${escapeHtml(item.name)}</strong><span class="row-total">${formatMoney(item.price_cents * item.quantity)}</span>
+      <strong>${escapeHtml(item.name)}${item.color ? ` · ${escapeHtml(item.color)}` : ""}${item.size ? ` · Tam. ${escapeHtml(item.size)}` : ""}</strong><span class="row-total">${formatMoney(item.price_cents * item.quantity)}</span>
       <div class="cart-controls">
-        <button class="qty-button" type="button" data-action="qty" data-id="${item.id}" data-change="-1" aria-label="Diminuir">−</button>
+        <button class="qty-button" type="button" data-action="qty" data-id="${item.id}" ${item.variantId ? `data-variant-id="${item.variantId}"` : ""} data-change="-1" aria-label="Diminuir">−</button>
         <span>${item.quantity}</span>
-        <button class="qty-button" type="button" data-action="qty" data-id="${item.id}" data-change="1" aria-label="Aumentar">+</button>
+        <button class="qty-button" type="button" data-action="qty" data-id="${item.id}" ${item.variantId ? `data-variant-id="${item.variantId}"` : ""} data-change="1" aria-label="Aumentar">+</button>
         <span>x ${formatMoney(item.price_cents)}</span>
-        <button class="remove-button" type="button" data-action="remove-cart" data-id="${item.id}">Remover</button>
+        <button class="remove-button" type="button" data-action="remove-cart" data-id="${item.id}" ${item.variantId ? `data-variant-id="${item.variantId}"` : ""}>Remover</button>
       </div>
     </div>`).join("");
 }
 
 function normalizeProductSearch(value) {
   return String(value ?? "").normalize("NFD").replace(/\p{Diacritic}/gu, "").trim().toLocaleLowerCase("pt-BR");
+}
+
+function productSizeType(...names) {
+  const category = normalizeProductSearch(names.filter(Boolean).join(" "));
+  if (/\b(calcados?|sapatos?|tenis|sandalias?|chinelos?|botas?)\b/.test(category)) return "footwear";
+  if (/\b(calcas?|jeans|leggings?|bermudas?|shorts?)\b/.test(category)) return "trousers";
+  if (/\b(roup\w*|vestuario\w*|vestimenta\w*|vestid\w*|moda\w*|camis\w*|blus\w*|uniforme\w*|lingerie|biquini|jaqueta\w*|moletom|meia|cueca|sutia|saia\w*)\b/.test(category)) return "clothing";
+  return null;
+}
+
+function productSizesForType(type) {
+  if (type === "footwear") return Array.from({ length: 14 }, (_, index) => String(index + 33));
+  if (type === "trousers") return Array.from({ length: 14 }, (_, index) => String(index * 2 + 34));
+  if (type === "clothing") return ["PP", "P", "M", "G", "GG", "XGG"];
+  return [];
+}
+
+function updateProductCategoryFields(variants = null) {
+  const sizeTypeSelect = $("#productSizeTypeSelect");
+  const type = sizeTypeSelect?.value || null;
+  const hasSizes = ["clothing", "trousers", "footwear"].includes(type);
+  const conditionLabel = $("#conditionLabel");
+  const conditionSelect = $("#conditionSelect");
+  const sizeField = $("#productSizeField");
+  const sizeOptions = $("#productSizeOptions");
+  const colorField = $("#productColorField");
+  const quantityLabel = $("#initialQuantityLabel");
+  const form = $("#productForm");
+  const quantityInput = form?.elements.quantity;
+  const subcategorySelect = $("#subcategorySelect");
+  if (subcategorySelect) {
+    subcategorySelect.required = subcategorySelect.options.length > 1;
+    subcategorySelect.closest("label").firstChild.textContent = subcategorySelect.required ? "Subcategoria *" : "Subcategoria";
+  }
+  const editing = Boolean(form?.elements.productId.value);
+  colorField?.classList.toggle("hidden", editing);
+  const currentVariants = variants ?? [...(sizeOptions?.querySelectorAll("[data-size-check]:checked") ?? [])].map((checkbox) => ({
+    size: checkbox.value,
+    quantity: Number(checkbox.closest("[data-size-row]").querySelector("[data-size-qty]").value || 0),
+  }));
+  const selected = new Map(currentVariants.map((variant) => [String(variant.size), Number(variant.quantity ?? variant.qty ?? 0)]));
+  const sizes = productSizesForType(type);
+
+  if (conditionLabel && conditionSelect) {
+    conditionLabel.classList.toggle("hidden", !hasSizes);
+    conditionSelect.required = hasSizes;
+    if (!hasSizes) conditionSelect.value = "";
+    else if (!conditionSelect.value) conditionSelect.value = "novo";
+  }
+  if (sizeField && sizeOptions && quantityInput) {
+    const colorMode = state.productColorRows.length > 0;
+    sizeField.classList.toggle("hidden", !hasSizes || colorMode);
+    quantityLabel.classList.toggle("hidden", hasSizes || colorMode);
+    quantityInput.disabled = hasSizes || colorMode;
+    quantityInput.required = !hasSizes && !colorMode && !editing;
+    sizeField.querySelector(".hint").textContent = editing
+      ? "Tamanhos existentes são mantidos. Use Ajustar ao lado de cada saldo para alterar o estoque."
+      : "Selecione os tamanhos e informe a quantidade disponível em cada um.";
+    sizeOptions.innerHTML = sizes.map((size, index) => {
+      const checked = selected.has(size);
+      return `<label class="product-size-option" data-size-row>
+        <input type="checkbox" data-size-check value="${size}" ${checked ? "checked" : ""} ${editing ? "disabled" : ""}>
+        <span>${size}</span>
+        <input type="number" min="0" max="2147483647" step="1" value="${checked ? selected.get(size) : 0}" data-size-qty aria-label="Estoque tamanho ${size}" ${checked && !editing ? "required" : "disabled"}>
+      </label>`;
+    }).join("");
+    updateProductSizeTotal();
+  }
+  renderProductColorRows(editing);
+}
+
+function updateProductSizeTotal() {
+  const form = $("#productForm");
+  const quantity = form?.elements.quantity;
+  const locked = Boolean(form?.elements.productId.value);
+  const selected = [...(form?.querySelectorAll("[data-size-check]:checked") ?? [])];
+  if (!quantity) return;
+  selected.forEach((checkbox) => {
+    const stock = checkbox.closest("[data-size-row]").querySelector("[data-size-qty]");
+    stock.disabled = !checkbox.checked || locked;
+    stock.required = checkbox.checked && !locked;
+  });
+  const total = selected.reduce((sum, checkbox) =>
+    sum + Number(checkbox.closest("[data-size-row]").querySelector("[data-size-qty]").value || 0), 0);
+  if (quantity.disabled) quantity.value = String(total);
+  updateProductStockTotal(total, quantity.disabled);
+}
+
+function updateProductStockTotal(total, isAutomatic) {
+  const summary = $("#productStockTotal");
+  if (!summary) return;
+  summary.hidden = !isAutomatic;
+  if (isAutomatic) summary.textContent = `Estoque total: ${total} unidade(s).`;
+}
+
+function renderProductColorRows(readOnly = false) {
+  const container = $("#productColorOptions");
+  if (!container) return;
+  const sizes = productSizesForType($("#productSizeTypeSelect")?.value);
+  container.innerHTML = state.productColorRows.map((color, colorIndex) => `
+    <section class="product-color-card" data-product-color-row="${colorIndex}">
+      <div class="product-color-card-heading">
+        <label>Nome da cor *<input type="text" maxlength="50" value="${escapeHtml(color.name)}" data-product-color-name="${colorIndex}" ${readOnly ? "disabled" : "required"}></label>
+        ${readOnly ? "" : `<button class="button secondary small-button" type="button" data-action="remove-product-color" data-index="${colorIndex}">Remover cor</button>`}
+      </div>
+      <label class="product-color-image-label">Imagem desta cor *<input type="file" accept="image/jpeg,image/png,image/webp" data-product-color-image="${colorIndex}" ${readOnly ? "disabled" : color.imageData ? "" : "required"}></label>
+      ${color.imageData ? `<img class="product-color-preview" src="${color.imageData}" alt="Prévia da cor ${escapeHtml(color.name)}">` : ""}
+      ${sizes.length ? `<strong>Tamanhos e estoque desta cor</strong><div class="product-size-options product-color-sizes">
+        ${sizes.map((size) => {
+    const selected = Object.hasOwn(color.quantities, size);
+    return `<label class="product-size-option" data-color-size-row>
+          <input type="checkbox" data-color-size="${colorIndex}:${size}" ${selected ? "checked" : ""} ${readOnly ? "disabled" : ""}>
+          <span>${size}</span>
+          <input type="number" min="0" max="2147483647" step="1" value="${selected ? Number(color.quantities[size]) : 0}" data-color-quantity="${colorIndex}:${size}" aria-label="Estoque ${escapeHtml(color.name || `cor ${colorIndex + 1}`)} tamanho ${size}" ${selected && !readOnly ? "required" : "disabled"}>
+        </label>`;
+  }).join("")}
+      </div>` : `<label>Estoque desta cor *<input type="number" min="0" max="2147483647" step="1" value="${Number(color.quantity ?? 0)}" data-color-quantity="${colorIndex}:" ${readOnly ? "disabled" : "required"}></label>`}
+    </section>`).join("");
+  updateProductColorTotal();
+}
+
+function updateProductColorTotal() {
+  const form = $("#productForm");
+  const quantity = form?.elements.quantity;
+  if (!quantity || !state.productColorRows.length) return;
+  const sizes = productSizesForType($("#productSizeTypeSelect")?.value);
+  const total = state.productColorRows.reduce((sum, color) => {
+    return sum + (sizes.length
+      ? sizes.reduce((colorTotal, size) => colorTotal + Number(color.quantities[size] || 0), 0)
+      : Number(color.quantity || 0));
+  }, 0);
+  quantity.value = String(total);
+  quantity.disabled = true;
+  quantity.required = false;
+  updateProductStockTotal(total, true);
+}
+
+function makeProductColorRow(color = {}) {
+  return {
+    name: String(color.name ?? ""),
+    imageData: color.imageData ?? null,
+    imagePromise: Promise.resolve(),
+    quantities: { ...(color.quantities ?? {}) },
+    quantity: Number(color.quantity ?? 0),
+  };
+}
+
+function normalizeDisplayName(value) {
+  return String(value ?? "")
+    .normalize("NFC")
+    .trim()
+    .replace(/\s+/gu, " ")
+    .toLocaleLowerCase("pt-BR")
+    .replace(/(^|[\s'’\-])(\p{L})/gu, (_, separator, letter) =>
+      `${separator}${letter.toLocaleUpperCase("pt-BR")}`);
 }
 
 function findExactSearchProduct(query) {
@@ -307,13 +511,35 @@ function findExactProductCode(query) {
   return matches.length === 1 ? matches[0] : null;
 }
 
-async function addProductToCart(productId) {
+function findExactVariantCode(query) {
+  const normalized = normalizeProductSearch(query);
+  if (!normalized) return null;
+  const matches = state.products.flatMap((product) => (product.variants ?? [])
+    .filter((variant) => [variant.sku, variant.barcode].some((code) => normalizeProductSearch(code) === normalized))
+    .map((variant) => ({ product, variant })));
+  return matches.length === 1 ? matches[0] : null;
+}
+
+async function addProductToCart(productId, variantId = null) {
   const product = state.products.find((item) => item.id === productId);
   if (!product || product.quantity < 1) return showToast("Produto sem estoque disponível.", true);
-  const item = state.cart.find((entry) => entry.id === productId);
-  if (item && item.quantity >= product.quantity) return showToast("A quantidade supera o estoque disponível.", true);
+  if (!variantId && product.variants?.length) return showToast("Selecione um tamanho ou use o código de barras da variação.", true);
+  const variant = variantId ? product.variants?.find((entry) => entry.id === variantId) : null;
+  if (variantId && !variant) return showToast("Tamanho do produto não encontrado.", true);
+  const stock = variant ? variant.quantity : product.quantity;
+  const item = state.cart.find((entry) => entry.id === productId && (entry.variantId ?? null) === variantId);
+  if (item && item.quantity >= stock) return showToast("A quantidade supera o estoque disponível para este tamanho.", true);
   if (item) item.quantity += 1;
-  else state.cart.push({ id: product.id, name: product.name, price_cents: product.price_cents, quantity: 1 });
+  else state.cart.push({
+    id: product.id,
+    variantId: variant?.id ?? null,
+    sku: variant?.sku ?? product.sku,
+    name: product.name,
+    color: variant?.color ?? null,
+    size: variant?.size ?? null,
+    price_cents: product.price_cents,
+    quantity: 1,
+  });
   state.selectedProductId = product.id;
   state.searchMatchProductId = null;
   await renderSales();
@@ -458,10 +684,18 @@ async function optimizeProductImage(file) {
 async function renderProducts() {
   state.productImageData = undefined;
   state.productImagesData = [];
-  state.productImagesData = [];
+  state.productImagesPromise = Promise.resolve([]);
   state.productImageDirty = false;
+  state.productColorRows = [];
   const products = await api(`/api/products?branchId=${state.branchId}`);
   state.products = products;
+
+  // Carregar marcas e categorias
+  const brands = await api("/api/brands");
+  const categories = await api("/api/categories");
+  state.brands = brands;
+  state.categories = categories;
+
   const canEdit = state.user.role !== "CASHIER";
   let syncEnabled = false;
   let siteCandidates = [];
@@ -510,15 +744,52 @@ async function renderProducts() {
       <h2 id="productFormTitle">Novo produto</h2>
       <input type="hidden" name="productId">
       <div class="form-grid">
-        <label>Nome do produto<input name="name" required maxlength="160"></label>
-        <label>Categoria<input name="category" maxlength="80"></label>
-        <label>SKU compartilhado com o site<input name="sku" maxlength="100" placeholder="Gerado pelo cadastro central" readonly></label>
-        <label>Preço de venda (R$)<input name="price" type="number" min="0" step="0.01" required></label>
-        <label>Custo (R$)<input name="cost" type="number" min="0" step="0.01" value="0"></label>
-        <label>Estoque mínimo<input name="minStock" type="number" min="0" step="1" value="0"></label>
-        <label id="initialQuantityLabel">Estoque inicial nesta unidade<input name="quantity" type="number" min="0" step="1" value="0"></label>
-        <label class="wide image-file-label">Imagens do produto (até 10)
-          <input id="productImageInput" name="images" type="file" accept="image/jpeg,image/png,image/webp" multiple>
+        <label>Nome do produto *<input name="name" required maxlength="160"></label>
+        <label>Marca *<select name="brandId" id="brandSelect" required>
+          <option value="">Selecione uma marca</option>
+          ${state.brands.map(brand => `<option value="${brand.id}">${escapeHtml(brand.name)}</option>`).join("")}
+        </select><button type="button" class="button secondary small-button" id="addBrandBtn">+</button></label>
+        <label>Tipo de peça *<select name="sizeType" id="productSizeTypeSelect" required>
+          <option value="">Selecione o tipo de peça</option>
+          <option value="clothing">Roupas em letras (PP a XGG: blusas, camisetas, vestidos, saias e jaquetas)</option>
+          <option value="trousers">Calça, legging, bermuda e shorts (numeração 34 a 60)</option>
+          <option value="footwear">Calçado (numeração 33 a 46)</option>
+          <option value="none">Outro produto, sem grade de tamanho</option>
+        </select></label>
+        <label>Categoria *<select name="categoryId" id="categorySelect" required>
+          <option value="">Selecione uma categoria</option>
+          ${state.categories.filter(cat => !cat.parent_id).map(cat => `<option value="${cat.id}" data-name="${escapeHtml(cat.name)}">${escapeHtml(cat.name)}</option>`).join("")}
+        </select><button type="button" class="button secondary small-button" id="addCategoryBtn">+</button></label>
+        <label>Subcategoria<select name="subcategoryId" id="subcategorySelect" disabled>
+          <option value="">Selecione uma subcategoria</option>
+        </select><button type="button" class="button secondary small-button" id="addSubcategoryBtn" title="Selecione uma categoria antes de cadastrar uma subcategoria">+</button></label>
+        <label class="wide">Descrição do produto *
+          <textarea name="description" id="productDescription" rows="4" maxlength="1000" placeholder="Descreva as características do produto (até 1.000 caracteres)." required></textarea>
+          <span id="productDescriptionCount" class="hint">0/1000 caracteres</span>
+        </label>
+        <label>Preço de venda (R$) *<input name="price" type="number" min="0" step="0.01" required></label>
+        <label>Custo (R$) *<input name="cost" type="number" min="0" step="0.01" required></label>
+        <label id="conditionLabel" class="hidden">Estado do produto *<select name="condition" id="conditionSelect">
+          <option value="">Selecione o estado</option>
+          <option value="novo">Novo</option>
+          <option value="seminovo">Seminovo</option>
+          <option value="brecho">Brechó</option>
+        </select></label>
+        <label>Estoque mínimo *<input name="minStock" type="number" min="0" step="1" required></label>
+        <label id="initialQuantityLabel">Estoque inicial nesta unidade *<input name="quantity" type="number" min="0" step="1" required></label>
+        <div id="productSizeField" class="wide hidden">
+          <strong>Tamanhos e estoque por tamanho *</strong>
+          <p class="hint">Selecione os tamanhos e informe a quantidade disponível em cada um.</p>
+          <div id="productSizeOptions" class="product-size-options"></div>
+        </div>
+        <div id="productColorField" class="wide product-color-field">
+          <div class="product-color-heading"><div><strong>Cores do produto</strong><p class="hint">Adicione uma foto para cada cor; o estoque será individual por cor e tamanho.</p></div>
+            <button class="button secondary small-button" type="button" data-action="add-product-color">Adicionar cor</button></div>
+          <div id="productColorOptions" class="product-color-options"></div>
+        </div>
+        <p id="productStockTotal" class="hint wide hidden" role="status" aria-live="polite"></p>
+        <label class="wide image-file-label">Imagens do produto (até 10) *
+          <input id="productImageInput" name="images" type="file" accept="image/jpeg,image/png,image/webp" multiple required>
           <span class="hint">A primeira imagem será usada no PDV; todas serão enviadas ao catálogo do site.</span>
         </label>
         <div class="product-image-editor wide">
@@ -528,27 +799,28 @@ async function renderProducts() {
           </div>
           <label id="removeProductImageLabel" class="image-remove hidden"><input id="removeProductImage" type="checkbox"> Remover imagem atual</label>
           <p id="productImageSelectionHint" class="hint">Nenhuma imagem selecionada.</p>
-          <p id="generatedProductCodes" class="hint">${syncEnabled
-    ? "SKU e código de barras são atribuídos pelo site antes de salvar o produto."
-    : "Configure a conexão com o site para cadastrar produtos e gerar códigos compartilhados."}</p>
         </div>
       </div>
-      <div class="form-actions"><button class="button primary" type="submit">Salvar produto</button><button id="cancelProductEdit" class="button secondary hidden" type="button">Cancelar edição</button></div>
+      <div class="form-actions"><button class="button primary" type="submit">Revisar e salvar produto</button><button id="cancelProductEdit" class="button secondary hidden" type="button">Cancelar edição</button></div>
     </form>` : ""}
     <section class="panel">
       <div class="panel-head"><h2>Estoque da unidade</h2><input id="inventorySearch" class="search-field" type="search" placeholder="Buscar produto"></div>
-      ${products.length ? `<div class="table-wrap"><table><thead><tr><th>Produto</th><th>SKU / Código de barras</th><th>Categoria</th><th>Preço</th><th>Saldo</th><th>Mínimo</th>${canEdit ? "<th>Ações</th>" : ""}</tr></thead><tbody>
-      ${products.map((product) => `<tr data-search="${escapeHtml([product.name, product.sku, product.barcode, product.category].join(" "))}"><td><div class="product-table-name">${productImage(product, "product-table-photo")}<strong>${escapeHtml(product.name)}</strong></div></td><td><span class="code-stack"><span>${escapeHtml(product.sku)}</span><span>${escapeHtml(product.barcode)}</span></span></td>
-        <td>${escapeHtml(product.category || "—")}</td><td>${formatMoney(product.price_cents)}</td>
-        <td><span class="badge ${product.quantity <= product.min_stock ? "canceled" : ""}">${product.quantity}</span></td>
+      ${products.length ? `<div class="table-wrap"><table><thead><tr><th>Produto</th><th>SKU / Código de barras</th><th>Marca / Categoria</th><th>Preço</th><th>Saldo</th><th>Mínimo</th>${canEdit ? "<th>Ações</th>" : ""}</tr></thead><tbody>
+      ${products.map((product) => `<tr data-search="${escapeHtml([product.name, product.sku, product.barcode, product.brand_name, product.category_name].join(" "))}"><td><div class="product-table-name">${productImage(product, "product-table-photo")}<strong>${escapeHtml(product.name)}</strong></div></td><td><span class="code-stack"><span>${escapeHtml(product.sku)}</span><span>${escapeHtml(product.barcode)}</span></span></td>
+        <td><small>${escapeHtml(product.brand_name || "—")}</small><br><small class="muted">${escapeHtml(product.category_name || "—")}</small></td><td>${formatMoney(product.price_cents)}</td>
+        <td>${product.variants?.length ? `<div class="size-stock-list">${product.variants.map((variant) => `<span><strong>${variant.color ? `${escapeHtml(variant.color)} · ` : ""}${escapeHtml(variant.size || "sem tamanho")}</strong>: ${variant.quantity}
+          <small>SKU ${escapeHtml(variant.sku)} · EAN ${escapeHtml(variant.barcode)}</small>
+          ${canEdit ? `<button class="button secondary small-button" type="button" data-action="adjust-size-stock" data-id="${product.id}" data-variant-id="${variant.id}">Ajustar</button>
+          <button class="button secondary small-button" type="button" data-action="transfer-size-stock" data-id="${product.id}" data-variant-id="${variant.id}" ${state.branches.some((branch) => branch.id !== state.branchId) ? "" : "disabled"}>Transferir</button>` : ""}</span>`).join("")}</div>` : `<span class="badge ${product.quantity <= product.min_stock ? "canceled" : ""}">${product.quantity}</span>`}</td>
         <td>${product.min_stock}</td>${canEdit ? `<td><div class="table-actions">
           <button class="button secondary" type="button" data-action="edit-product" data-id="${product.id}">Editar</button>
-          <button class="button secondary" type="button" data-action="adjust-stock" data-id="${product.id}">Ajustar</button>
-          <button class="button secondary" type="button" data-action="transfer-stock" data-id="${product.id}" ${state.branches.some((branch) => branch.id !== state.branchId) ? "" : "disabled"}>Transferir</button>
+          ${product.variants?.length ? "" : `<button class="button secondary" type="button" data-action="adjust-stock" data-id="${product.id}">Ajustar</button>`}
+          <button class="button secondary" type="button" data-action="transfer-stock" data-id="${product.id}" ${state.branches.some((branch) => branch.id !== state.branchId) && !product.variants?.length ? "" : "disabled"}>Transferir</button>
         </div></td>` : ""}</tr>`).join("")}
       </tbody></table></div>` : `<div class="empty">Nenhum produto cadastrado.</div>`}
     </section>
     ${reconciliation}`;
+      updateProductCategoryFields();
 }
 
 async function renderPromotions() {
@@ -1346,34 +1618,43 @@ function resetProductForm() {
   if (!form) return;
   form.reset();
   form.elements.productId.value = "";
-  form.elements.cost.value = "0";
-  form.elements.minStock.value = "0";
-  form.elements.quantity.value = "0";
+  $("#productDescriptionCount").textContent = "0/1000 caracteres";
+  form.elements.cost.value = "";
+  form.elements.minStock.value = "";
+  form.elements.quantity.value = "";
   form.elements.images.value = "";
+  form.elements.images.required = true;
+  $("#productSizeTypeSelect").disabled = false;
   $("#productImageInput").multiple = true;
   $("#productImageSelectionHint").textContent = "Nenhuma imagem selecionada.";
   $("#removeProductImage").checked = false;
   $("#removeProductImageLabel").classList.add("hidden");
   state.productImageData = undefined;
+  state.productImagesData = [];
+  state.productImagesPromise = Promise.resolve([]);
   state.productImageDirty = false;
+  state.productColorRows = [];
   clearProductImagePreview();
   $("#productFormTitle").textContent = "Novo produto";
   $("#initialQuantityLabel").classList.remove("hidden");
   $("#cancelProductEdit").classList.add("hidden");
+  updateProductCategoryFields([]);
 }
 
-function changeCartQuantity(productId, delta) {
-  const item = state.cart.find((entry) => entry.id === productId);
+function changeCartQuantity(productId, delta, variantId = null) {
+  const item = state.cart.find((entry) => entry.id === productId && (entry.variantId ?? null) === variantId);
   const product = state.products.find((entry) => entry.id === productId);
   if (!item || !product) return;
+  const variant = variantId ? product.variants?.find((entry) => entry.id === variantId) : null;
+  const stock = variant ? variant.quantity : product.quantity;
   state.selectedProductId = productId;
   const next = item.quantity + delta;
   if (next < 1) {
-    state.cart = state.cart.filter((entry) => entry.id !== productId);
+    state.cart = state.cart.filter((entry) => !(entry.id === productId && (entry.variantId ?? null) === variantId));
     if (state.selectedProductId === productId) state.selectedProductId = state.cart.at(-1)?.id ?? null;
   }
-  else if (next <= product.quantity) item.quantity = next;
-  else return showToast("A quantidade supera o estoque disponível.", true);
+  else if (next <= stock) item.quantity = next;
+  else return showToast("A quantidade supera o estoque disponível para este tamanho.", true);
   renderSales().catch((error) => showToast(error.message, true));
 }
 
@@ -1553,6 +1834,7 @@ async function handleSubmit(event) {
           sourceBranchId: state.branchId,
           targetBranchId: Number(value("targetBranchId")),
           productId: Number(value("productId")),
+          ...(value("variantId") ? { variantId: Number(value("variantId")) } : {}),
           quantity: Number(value("quantity")),
           note: value("note"),
         },
@@ -1583,20 +1865,90 @@ async function handleSubmit(event) {
     if (form.id === "productForm") {
       event.preventDefault();
       const priceCents = parseMoney(value("price"));
-      const costCents = parseMoney(value("cost") || "0");
+      const costCents = parseMoney(value("cost"));
       if (priceCents === null || costCents === null) throw new Error("Informe preços válidos com até duas casas decimais.");
       const productId = Number(value("productId"));
+      form.elements.name.value = normalizeDisplayName(value("name"));
       const product = {
-        name: value("name"), sku: value("sku").trim(), category: value("category"), priceCents, costCents,
+        name: form.elements.name.value,
+        brandId: Number(value("brandId")),
+        sizeType: $("#productSizeTypeSelect").value,
+        categoryId: Number(value("categoryId")),
+        subcategoryId: value("subcategoryId") ? Number(value("subcategoryId")) : null,
+        description: value("description"),
+        priceCents, costCents,
         minStock: Number(value("minStock")),
+        condition: value("condition") || null,
       };
+      const sizeMode = !$("#productSizeField").classList.contains("hidden");
+      const selectedVariants = sizeMode
+        ? [...form.querySelectorAll("[data-size-check]:checked")].map((checkbox) => ({
+          size: checkbox.value,
+          quantity: Number(checkbox.closest("[data-size-row]").querySelector("[data-size-qty]").value),
+        }))
+        : [];
+      let colors = [];
+      let colorVariants = [];
+      if (!productId && state.productColorRows.length) {
+        await Promise.all(state.productColorRows.map((color) => color.imagePromise));
+        colors = state.productColorRows.map((color) => ({
+          name: color.name.trim(),
+          imageData: color.imageData,
+        }));
+        if (colors.some((color) => !color.name || !color.imageData)) {
+          throw new Error("Informe o nome e selecione uma imagem para cada cor.");
+        }
+        if (new Set(colors.map((color) => color.name.toLocaleLowerCase("pt-BR"))).size !== colors.length) {
+          throw new Error("Não repita o nome de uma cor.");
+        }
+        const sizes = productSizesForType(product.sizeType);
+        for (const color of state.productColorRows) {
+          const variants = sizes.length
+            ? sizes.filter((size) => Object.hasOwn(color.quantities, size))
+              .map((size) => ({ size, quantity: Number(color.quantities[size]) }))
+            : [{ size: null, quantity: Number(color.quantity) }];
+          if (!variants.length) {
+            throw new Error(`Selecione ao menos um tamanho para a cor ${color.name.trim()}.`);
+          }
+          if (variants.some((variant) => !Number.isSafeInteger(variant.quantity)
+            || variant.quantity < 0 || variant.quantity > 2147483647)) {
+            throw new Error(`Informe um estoque inteiro válido para a cor ${color.name.trim()}.`);
+          }
+          colorVariants.push(...variants.map((variant) => ({
+            ...variant,
+            color: color.name.trim(),
+          })));
+        }
+      }
+      if (!productId) {
+        await state.productImagesPromise;
+        if (!state.productImagesData.length) {
+          throw new Error("Aguarde o processamento e selecione pelo menos uma imagem do produto.");
+        }
+        const imageDataLength = [...state.productImagesData, ...colors.map((color) => color.imageData)]
+          .reduce((total, image) => total + image.length, 0);
+        if (imageDataLength > 1_300_000) {
+          throw new Error("O conjunto das imagens ficou grande demais para sincronizar. Reduza a quantidade ou escolha imagens menores.");
+        }
+      }
+      if (sizeMode && !selectedVariants.length) {
+        throw new Error("Selecione pelo menos um tamanho e informe o estoque correspondente.");
+      }
+      if (!window.confirm("Tem certeza de que está tudo certo com os dados do produto? Confirme para concluir o cadastro.")) return;
+      if (!productId) {
+        product.variants = colors.length ? colorVariants : selectedVariants;
+        if (colors.length) product.colors = colors;
+      }
+      const submittedVariants = colors.length ? colorVariants : selectedVariants;
+      product.quantity = sizeMode || colors.length
+        ? submittedVariants.reduce((total, variant) => total + variant.quantity, 0)
+        : Number(form.elements.quantity.value);
       if (state.productImageDirty) product.imageData = state.productImageData;
       if (productId) {
         await api(`/api/products/${productId}`, { method: "PUT", body: product });
         showToast("Produto atualizado.");
       } else {
         product.branchId = state.branchId;
-        product.quantity = Number(value("quantity"));
         product.images = state.productImagesData;
         const created = await api("/api/products", { method: "POST", body: product });
         showToast(`Produto cadastrado · SKU ${created.sku} · código de barras ${created.barcode}.`);
@@ -1710,6 +2062,70 @@ async function handleClick(event) {
   const button = event.target.closest("button");
   if (!button) return;
   try {
+    if (button.dataset.action === "add-product-color") {
+      if (state.productColorRows.length >= 10) throw new Error("Cadastre no máximo 10 cores por produto.");
+      state.productColorRows.push(makeProductColorRow());
+      updateProductCategoryFields();
+      $(`[data-product-color-name="${state.productColorRows.length - 1}"]`)?.focus();
+      return;
+    }
+    if (button.dataset.action === "remove-product-color") {
+      state.productColorRows.splice(Number(button.dataset.index), 1);
+      updateProductCategoryFields();
+      return;
+    }
+    if (button.id === "addBrandBtn") {
+      const name = await requestText("Cadastrar marca", "Nome da marca", {
+        placeholder: "Ex.: Minha marca",
+        maxLength: 100,
+      });
+      if (!name) return;
+      const brand = await api("/api/brands", { method: "POST", body: { name } });
+      state.brands.push(brand);
+      const brandSelect = $("#brandSelect");
+      brandSelect.add(new Option(brand.name, brand.id));
+      brandSelect.value = String(brand.id);
+      showToast("Marca cadastrada com sucesso.");
+      return;
+    }
+    if (button.id === "addCategoryBtn") {
+      const name = await requestText("Cadastrar categoria", "Nome da categoria", {
+        placeholder: "Ex.: Vestuário",
+        maxLength: 100,
+      });
+      if (!name) return;
+      const category = await api("/api/categories", { method: "POST", body: { name } });
+      state.categories.push(category);
+      const categorySelect = $("#categorySelect");
+      categorySelect.add(new Option(category.name, category.id));
+      categorySelect.value = String(category.id);
+      categorySelect.dispatchEvent(new Event("change", { bubbles: true }));
+      showToast("Categoria cadastrada com sucesso.");
+      return;
+    }
+    if (button.id === "addSubcategoryBtn") {
+      const categoryId = Number($("#categorySelect").value);
+      if (!categoryId) {
+        showToast("Selecione uma categoria primeiro.", true);
+        return;
+      }
+      const name = await requestText("Cadastrar subcategoria", "Nome da subcategoria", {
+        placeholder: "Ex.: Camisetas",
+        maxLength: 100,
+      });
+      if (!name) return;
+      const subcategory = await api("/api/categories", {
+        method: "POST",
+        body: { name, parentId: categoryId },
+      });
+      state.categories.push(subcategory);
+      const subcategorySelect = $("#subcategorySelect");
+      subcategorySelect.add(new Option(subcategory.name, subcategory.id));
+      subcategorySelect.value = String(subcategory.id);
+      updateProductCategoryFields();
+      showToast("Subcategoria cadastrada com sucesso.");
+      return;
+    }
     if (button.dataset.view) return switchView(button.dataset.view);
     if (button.id === "openSalesHistory") return await openSalesHistory();
     if (button.id === "closeSalesHistory") {
@@ -1772,7 +2188,7 @@ async function handleClick(event) {
     }
     const id = Number(button.dataset.id);
     if (button.dataset.action === "add-product") {
-      return await addProductToCart(id);
+      return await addProductToCart(id, button.dataset.variantId ? Number(button.dataset.variantId) : null);
     }
     if (button.dataset.action === "refresh-site-products") return await renderProducts();
     if (button.dataset.action === "link-site-product") {
@@ -1788,9 +2204,10 @@ async function handleClick(event) {
       showToast(`Produto "${product.name}" vinculado ao site.`);
       return await renderProducts();
     }
-    if (button.dataset.action === "qty") return changeCartQuantity(id, Number(button.dataset.change));
+    if (button.dataset.action === "qty") return changeCartQuantity(id, Number(button.dataset.change), button.dataset.variantId ? Number(button.dataset.variantId) : null);
     if (button.dataset.action === "remove-cart") {
-      state.cart = state.cart.filter((item) => item.id !== id);
+      const variantId = button.dataset.variantId ? Number(button.dataset.variantId) : null;
+      state.cart = state.cart.filter((item) => !(item.id === id && (item.variantId ?? null) === variantId));
       if (state.selectedProductId === id) state.selectedProductId = state.cart.at(-1)?.id ?? null;
       return renderSales();
     }
@@ -1817,7 +2234,9 @@ async function handleClick(event) {
     }
     if (button.dataset.action === "receipt") return await showReceipt(id);
     if (button.dataset.action === "cancel-sale") {
-      const reason = prompt("Informe o motivo do cancelamento da venda:");
+      const reason = await requestText("Cancelar venda", "Motivo do cancelamento", {
+        placeholder: "Descreva o motivo",
+      });
       if (!reason?.trim()) return;
       if (!confirm(`Cancelar a venda #${id}?\n\nO estoque será reposto e o valor removido das vendas concluídas. O estorno em dinheiro será registrado como saída do caixa. Confirme estornos de Pix/cartão na operadora.`)) return;
       const result = await api(`/api/sales/${id}/cancel`, { method: "POST", body: { reason } });
@@ -1838,22 +2257,47 @@ async function handleClick(event) {
       if (!product || !form) return;
       form.elements.productId.value = product.id;
       form.elements.name.value = product.name;
-      form.elements.sku.value = product.sku;
-      form.elements.category.value = product.category;
+      form.elements.description.value = product.description || "";
+      $("#productDescriptionCount").textContent = `${form.elements.description.value.length}/1000 caracteres`;
+      form.elements.brandId.value = product.brand_id || "";
+      const productCategory = state.categories.find((category) => category.id === product.category_id);
+      $("#productSizeTypeSelect").value = product.size_type || productSizeType(productCategory?.name,
+        productCategory?.parent_id ? state.categories.find((category) => category.id === productCategory.parent_id)?.name : null) || "none";
+      $("#productSizeTypeSelect").disabled = true;
+      form.elements.categoryId.value = productCategory?.parent_id || product.category_id || "";
       form.elements.price.value = (product.regular_price_cents / 100).toFixed(2);
       form.elements.cost.value = (product.cost_cents / 100).toFixed(2);
       form.elements.minStock.value = product.min_stock;
+      form.elements.condition.value = product.condition || "";
+
+      // Carregar subcategorias se categoria estiver selecionada
+      if (product.category_id) {
+        const categoryId = Number(product.category_id);
+        const subcategorySelect = $("#subcategorySelect");
+        if (subcategorySelect) {
+          subcategorySelect.innerHTML = `<option value="">Selecione uma subcategoria</option>`;
+          const subcategories = state.categories.filter(cat => cat.parent_id === categoryId);
+          subcategories.forEach(sub => {
+            subcategorySelect.innerHTML += `<option value="${sub.id}">${escapeHtml(sub.name)}</option>`;
+          });
+          subcategorySelect.disabled = false;
+          subcategorySelect.value = productCategory?.parent_id ? product.category_id : "";
+        }
+      }
+
+      updateProductCategoryFields(product.variants ?? []);
       state.productImageData = undefined;
       state.productImagesData = [];
+      state.productImagesPromise = Promise.resolve([]);
       state.productImageDirty = false;
       $("#productImageInput").multiple = false;
+      $("#productImageInput").required = !product.has_image;
       $("#productImageInput").value = "";
       $("#productImageSelectionHint").textContent = "Ao substituir, só a imagem do PDV será atualizada.";
       $("#removeProductImage").checked = false;
       $("#removeProductImageLabel").classList.toggle("hidden", !product.has_image);
       if (product.has_image) renderProductImagePreview(`/api/products/${product.id}/image`);
       else clearProductImagePreview();
-      $("#generatedProductCodes").textContent = `SKU ${product.sku} · código de barras ${product.barcode}`;
       $("#productFormTitle").textContent = `Editar: ${product.name}`;
       $("#initialQuantityLabel").classList.add("hidden");
       $("#cancelProductEdit").classList.remove("hidden");
@@ -1862,16 +2306,43 @@ async function handleClick(event) {
     }
     if (button.dataset.action === "adjust-stock") {
       const product = state.products.find((item) => item.id === id);
-      const deltaText = prompt(`Saldo atual de ${product?.name}: ${product?.quantity}. Informe a alteração (ex.: 5 para entrada ou -2 para saída):`);
+      const deltaText = await requestText(
+        "Ajustar estoque",
+        `Saldo atual de ${product?.name}: ${product?.quantity}. Informe a alteração (ex.: 5 para entrada ou -2 para saída).`,
+      );
       if (deltaText === null) return;
       const delta = Number(deltaText);
       if (!Number.isSafeInteger(delta) || delta === 0) return showToast("Informe uma quantidade inteira diferente de zero.", true);
-      const note = prompt("Motivo do ajuste de estoque:");
+      const note = await requestText("Ajustar estoque", "Motivo do ajuste", {
+        placeholder: "Descreva o motivo",
+      });
       if (!note?.trim()) return;
       await api("/api/inventory/adjust", {
         method: "POST", body: { branchId: state.branchId, productId: id, delta, note: note.trim() },
       });
       showToast("Estoque atualizado.");
+      return renderProducts();
+    }
+    if (button.dataset.action === "adjust-size-stock") {
+      const product = state.products.find((item) => item.id === id);
+      const variant = product?.variants?.find((item) => item.id === Number(button.dataset.variantId));
+      if (!product || !variant) throw new Error("Tamanho não encontrado.");
+      const deltaText = await requestText(
+        "Ajustar estoque por tamanho",
+        `Saldo ${variant.color ? `${variant.color} · ` : ""}${variant.size || "sem tamanho"} de ${product.name}: ${variant.quantity}. Informe a alteração (ex.: 5 ou -2).`,
+      );
+      if (deltaText === null) return;
+      const delta = Number(deltaText);
+      if (!Number.isSafeInteger(delta) || delta === 0) return showToast("Informe uma quantidade inteira diferente de zero.", true);
+      const note = await requestText("Ajustar estoque", "Motivo do ajuste", {
+        placeholder: "Descreva o motivo",
+      });
+      if (!note?.trim()) return;
+      await api("/api/inventory/variant-adjust", {
+        method: "POST",
+        body: { branchId: state.branchId, variantId: variant.id, delta, note: note.trim() },
+      });
+      showToast(`Estoque da variação ${variant.color ? `${variant.color} · ` : ""}${variant.size || "sem tamanho"} atualizado.`);
       return renderProducts();
     }
     if (button.dataset.action === "transfer-stock") {
@@ -1880,11 +2351,29 @@ async function handleClick(event) {
       if (!product || !targets.length) return showToast("Cadastre outra unidade para transferir estoque.", true);
       const form = $("#transferForm");
       form.elements.productId.value = String(product.id);
+      form.elements.variantId.value = "";
       form.elements.quantity.value = "";
       form.elements.note.value = "";
       $("#transferProductName").textContent = `${product.name} · saldo disponível: ${product.quantity}`;
       form.elements.targetBranchId.innerHTML = targets.map((branch) =>
         `<option value="${branch.id}">${escapeHtml(branch.name)}</option>`).join("");
+      $("#transferDialog").showModal();
+      return;
+    }
+    if (button.dataset.action === "transfer-size-stock") {
+      const product = state.products.find((item) => item.id === id);
+      const variant = product?.variants?.find((item) => item.id === Number(button.dataset.variantId));
+      const targets = state.branches.filter((branch) => branch.id !== state.branchId);
+      if (!product || !variant) throw new Error("Tamanho não encontrado.");
+      if (!targets.length) return showToast("Cadastre outra unidade para transferir estoque.", true);
+      const form = $("#transferForm");
+      form.elements.productId.value = String(product.id);
+      form.elements.variantId.value = String(variant.id);
+      $("#transferProductName").textContent = `${product.name} · ${variant.color ? `${variant.color} · ` : ""}${variant.size || "sem tamanho"} · saldo ${variant.quantity}`;
+      form.elements.targetBranchId.innerHTML = targets.map((branch) =>
+        `<option value="${branch.id}">${escapeHtml(branch.name)}</option>`).join("");
+      form.elements.quantity.value = "";
+      form.elements.note.value = "";
       $("#transferDialog").showModal();
       return;
     }
@@ -1944,7 +2433,11 @@ async function handleClick(event) {
             branchId: state.branchId,
             customerId: $("#saleCustomer").value || null,
             discountCents: total.discount,
-            items: state.cart.map((item) => ({ productId: item.id, quantity: item.quantity })),
+            items: state.cart.map((item) => ({
+              productId: item.id,
+              ...(item.variantId ? { variantId: item.variantId } : {}),
+              quantity: item.quantity,
+            })),
             payments: state.paymentRows.map((payment) => ({
               method: payment.method,
               amountCents: payment.amountCents,
@@ -1978,6 +2471,11 @@ document.addEventListener("submit", handleSubmit);
 document.addEventListener("click", (event) => {
   handleClick(event).catch((error) => showToast(error.message, true));
 });
+document.addEventListener("focusout", (event) => {
+  if (event.target.form?.id === "productForm" && event.target.name === "name") {
+    event.target.value = normalizeDisplayName(event.target.value);
+  }
+});
 document.addEventListener("change", (event) => {
   if (!event.target.matches("[data-site-candidate]")) return;
   const row = event.target.closest("tr");
@@ -2010,6 +2508,24 @@ $("#logoutButton").addEventListener("click", async () => {
   setAuthMode(false);
 });
 document.addEventListener("input", (event) => {
+  if (event.target.matches?.("[data-size-qty]")) updateProductSizeTotal();
+  if (event.target.matches?.("[data-product-color-name]")) {
+    const color = state.productColorRows[Number(event.target.dataset.productColorName)];
+    if (color) color.name = event.target.value;
+  }
+  if (event.target.matches?.("[data-color-quantity]")) {
+    const [colorIndex, ...sizeParts] = event.target.dataset.colorQuantity.split(":");
+    const color = state.productColorRows[Number(colorIndex)];
+    if (color) {
+      const size = sizeParts.join(":");
+      if (size === "") color.quantity = Number(event.target.value || 0);
+      else color.quantities[size] = Number(event.target.value || 0);
+      updateProductColorTotal();
+    }
+  }
+  if (event.target.id === "productDescription") {
+    $("#productDescriptionCount").textContent = `${event.target.value.length}/1000 caracteres`;
+  }
   if (event.target.id === "labelProductSearch") {
     const query = normalizeProductSearch(event.target.value);
     $$("#labelProductList .label-product-row").forEach((row) => {
@@ -2038,6 +2554,13 @@ document.addEventListener("input", (event) => {
   if (event.target.id === "productSearch") {
     const query = normalizeProductSearch(event.target.value);
     if (query !== state.lastAutoAddedCode) state.lastAutoAddedCode = null;
+    const exactVariant = findExactVariantCode(query);
+    if (exactVariant) {
+      state.lastAutoAddedCode = query;
+      addProductToCart(exactVariant.product.id, exactVariant.variant.id)
+        .catch((error) => showToast(error.message, true));
+      return;
+    }
     const exactCodeProduct = findExactProductCode(query);
     if (exactCodeProduct) {
       state.lastAutoAddedCode = query;
@@ -2068,6 +2591,62 @@ document.addEventListener("input", (event) => {
 });
 document.addEventListener("change", (event) => {
   if (event.target.id === "saleCustomer") state.customerId = event.target.value;
+  if (event.target.id === "productSizeTypeSelect") {
+    updateProductCategoryFields([]);
+  }
+  if (event.target.id === "categorySelect") {
+    const categoryId = Number(event.target.value);
+    const category = state.categories.find(cat => cat.id === categoryId);
+    const subcategorySelect = $("#subcategorySelect");
+    if (subcategorySelect) {
+      subcategorySelect.innerHTML = `<option value="">Selecione uma subcategoria</option>`;
+      if (categoryId) {
+        const subcategories = state.categories.filter(cat => cat.parent_id === categoryId);
+        subcategories.forEach(sub => {
+          subcategorySelect.innerHTML += `<option value="${sub.id}">${escapeHtml(sub.name)}</option>`;
+        });
+        subcategorySelect.disabled = false;
+      } else {
+        subcategorySelect.disabled = true;
+      }
+    }
+
+    updateProductCategoryFields();
+  }
+  if (event.target.id === "subcategorySelect") updateProductCategoryFields();
+  if (event.target.matches?.("[data-size-check]")) updateProductSizeTotal();
+  if (event.target.matches?.("[data-color-size]")) {
+    const [colorIndex, size] = event.target.dataset.colorSize.split(":");
+    const color = state.productColorRows[Number(colorIndex)];
+    if (color) {
+      if (event.target.checked) {
+        const quantityInput = event.target.closest("[data-color-size-row]").querySelector("[data-color-quantity]");
+        color.quantities[size] = Number(quantityInput.value || 0);
+      } else {
+        delete color.quantities[size];
+      }
+      updateProductCategoryFields();
+    }
+  }
+  if (event.target.matches?.("[data-product-color-image]")) {
+    const index = Number(event.target.dataset.productColorImage);
+    const color = state.productColorRows[index];
+    const file = event.target.files?.[0];
+    if (color && file) {
+      const processing = optimizeProductImage(file).then((imageData) => {
+        color.imageData = imageData;
+        if (state.productColorRows.includes(color)) renderProductColorRows();
+        return imageData;
+      }).catch((error) => {
+        event.target.value = "";
+        color.imageData = null;
+        showToast(error.message, true);
+        renderProductColorRows();
+        return null;
+      });
+      color.imagePromise = processing;
+    }
+  }
   if (event.target.id === "labelSize") {
     $("#customLabelSize").classList.toggle("hidden", event.target.value !== "custom");
     updateBarcodePreview();
@@ -2076,13 +2655,16 @@ document.addEventListener("change", (event) => {
   if (event.target.id === "productImageInput") {
     const input = event.target;
     const files = [...(input.files ?? [])];
+    state.productImagesData = [];
+    state.productImagesPromise = Promise.resolve([]);
     if (!files.length) return;
     if (files.length > 10) {
       input.value = "";
       showToast("Selecione no máximo 10 imagens.", true);
       return;
     }
-    Promise.all(files.map(optimizeProductImage)).then((images) => {
+    const processing = Promise.all(files.map(optimizeProductImage)).then((images) => {
+      if (state.productImagesPromise !== processing) return [];
       const totalLength = images.reduce((total, image) => total + image.length, 0);
       if (totalLength > 1_300_000) {
         throw new Error("O conjunto das imagens ficou grande demais para sincronizar. Reduza a quantidade ou escolha imagens menores.");
@@ -2093,12 +2675,17 @@ document.addEventListener("change", (event) => {
       $("#removeProductImage").checked = false;
       renderProductImagePreview(images[0]);
       $("#productImageSelectionHint").textContent = `${images.length} imagem(ns) selecionada(s); o PDV usa a primeira.`;
+      return images;
     }).catch((error) => {
-      input.value = "";
-      state.productImagesData = [];
-      state.productImageData = undefined;
-      showToast(error.message, true);
+      if (state.productImagesPromise === processing) {
+        input.value = "";
+        state.productImagesData = [];
+        state.productImageData = undefined;
+        showToast(error.message, true);
+      }
+      return [];
     });
+    state.productImagesPromise = processing;
   }
   if (event.target.id === "removeProductImage") {
     state.productImageDirty = true;

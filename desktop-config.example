@@ -1,0 +1,5 @@
+# Configuração opcional para sincronizar o PDV com o site LDM.
+# Remova o # e preencha URL, token e unidade para habilitar a sincronização.
+# PDV_SITE_SYNC_URL=https://seu-site.com
+# PDV_SITE_SYNC_TOKEN=seu-token-secreto-de-pelo-menos-32-caracteres
+PDV_SITE_SYNC_BRANCH_NAME=Unidade principal

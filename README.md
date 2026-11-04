@@ -7,6 +7,27 @@ Sistema de ponto de venda em português, com interface web e banco SQLite persis
 - Node.js 22.5 ou mais recente.
 - Dependências instaladas com `npm install`; o banco SQLite já é integrado ao Node.js.
 
+## Aplicativo desktop para Windows
+
+O PDV também pode ser executado em uma janela própria, sem abrir o navegador ou iniciar o servidor manualmente. A versão desktop inclui o servidor local e o SQLite, e foi projetada para uso em um único computador de caixa; ela não substitui o servidor central usado por vários computadores na rede.
+
+Para executar em desenvolvimento, instale as dependências e inicie o aplicativo:
+
+```powershell
+npm install
+npm run desktop
+```
+
+Para gerar o instalador do Windows (64 bits), execute:
+
+```powershell
+npm run desktop:dist
+```
+
+O instalador será criado na pasta `release`. O computador de destino não precisa ter Node.js. Na primeira execução, é possível selecionar um banco SQLite existente para importá-lo; a importação cria uma cópia e preserva o arquivo original. No modo de desenvolvimento, o banco em `data/pdv.sqlite` é copiado automaticamente quando ainda não existe uma base desktop.
+
+O banco desktop e seus backups ficam em `%APPDATA%\PontoCerto PDV`. O aplicativo cria até sete backups diários automáticos; mantenha cópias adicionais em outro dispositivo ou local seguro. No menu **Ajuda**, use **Abrir pasta de dados e backups** para acessá-los. Para habilitar a sincronização com o site na versão instalada, configure URL, token e unidade no arquivo `.env` aberto pelo menu **Ajuda > Abrir configuração de sincronização** e reinicie o aplicativo. Sem configuração do site, as vendas continuam locais, mas não serão sincronizadas. O instalador ainda não possui assinatura digital; o Windows pode exibir um aviso de segurança ao executá-lo.
+
 ## Iniciar no Windows
 
 Abra o PowerShell nesta pasta e execute:
@@ -25,7 +46,6 @@ O banco é criado em `data/pdv.sqlite`. Para usar outra localização, defina `P
 Para permitir conexões de outros computadores na rede, configure o servidor para escutar na rede e permita a porta escolhida no firewall:
 
 ```powershell
-$env:HOST = "0.0.0.0"
 $env:PORT = "3000"
 npm start
 ```
@@ -35,18 +55,17 @@ O aplicativo deve ficar em um único servidor; não copie o arquivo SQLite para 
 Para acesso pela internet, publique o servidor atrás de um proxy HTTPS (por exemplo, Caddy ou Nginx), restrinja o acesso ao serviço e habilite o cookie seguro:
 
 ```powershell
-$env:HOST = "127.0.0.1"
 $env:PORT = "3000"
 $env:PDV_COOKIE_SECURE = "true"
 npm start
 ```
 
-O proxy deve encaminhar o tráfego HTTPS para o servidor local. Não exponha a porta do Node diretamente à internet. Faça backup do banco antes de atualizações e teste a restauração. O SQLite é indicado para instalações pequenas ou médias em um único servidor; avalie PostgreSQL se o volume de gravações simultâneas crescer.
+Em hospedagens gerenciadas, use a porta fornecida pela plataforma e permita que o proxy HTTPS encaminhe o tráfego para o processo Node. `0.0.0.0` é o endereço de escuta interno, não a URL pública do aplicativo. Não exponha a porta do Node diretamente à internet. Faça backup do banco antes de atualizações e teste a restauração. O SQLite é indicado para instalações pequenas ou médias em um único servidor; avalie PostgreSQL se o volume de gravações simultâneas crescer.
 
 ## Funções incluídas
 
 - Cadastro inicial da loja, login, alteração de senha, sessão protegida e perfis administrador, gerente e operador.
-- Cadastro e edição de produtos com foto otimizada, SKU e código de barras compartilhados com o site, preços, categorias e custo. Os códigos internos não são GTIN/EAN comerciais e não substituem códigos licenciados pela GS1.
+- Cadastro e edição de produtos com foto otimizada, SKU e código de barras compartilhados com o site, preços, categorias e custo. O tipo de peça separa as grades de roupas (PP a XGG), calças/leggings (34 a 60) e calçados (33 a 46), com estoque independente por tamanho. Os códigos internos não são GTIN/EAN comerciais e não substituem códigos licenciados pela GS1.
 - Página de promoções para definir percentual de desconto e período; o preço promocional é aplicado automaticamente no caixa durante o período agendado.
 - Página de etiquetas para gerar PDF A4 com Code 128 por produto, limitada a 36 etiquetas por folha/seleção, com tamanhos prontos (30 × 20, 40 × 25, 50 × 30 e 60 × 40 mm) e tamanho personalizado. O formato Code 128 evita que leitores interpretem o prefixo interno 20–29 como código de preço/peso. As etiquetas mantêm as medidas escolhidas, com conteúdo separado em áreas para nome, barras, número e preço; as fileiras são centralizadas e usam intervalos de 1 mm para aproveitar a folha. Habilite Code 128 no leitor e imprima em escala de 100%, sem modo rascunho/economia de tinta; etiquetas muito estreitas ainda podem limitar a leitura.
 - Estoque por unidade, entradas e saídas com motivo, transferência entre unidades e histórico de movimentações.
@@ -79,7 +98,9 @@ O PDV compartilha cadastros de produtos com o site e envia preços, promoções 
 4. Para produtos que já existem nos dois sistemas, um administrador ou gerente pode abrir **Produtos e estoque**, comparar os nomes e selecionar explicitamente o correspondente no site. Nenhum vínculo ou alteração de códigos é feito automaticamente pelo nome. SKU e código de barras permanecem visíveis na lista local.
 5. Confira as quantidades na unidade configurada. Em **Promoções**, o administrador pode usar **Alinhar estoque e preços iniciais** para substituir no site os saldos e preços pelos valores atuais do PDV.
 
-Depois disso, vendas, cancelamentos, entradas, saídas e ajustes da unidade configurada são enviados automaticamente. Pedidos de teste do site são consultados a cada ciclo de sincronização, aplicados de modo idempotente e confirmados ao Laravel; se o estoque local for insuficiente, o pedido permanece pendente e o PDV não permite que o saldo fique negativo. Cadastros e importações são repetidos com segurança quando houver falha de rede, e produtos importados não são reenviados ao site. A fila de eventos fica salva no SQLite e tenta novamente quando a conexão retorna; falhas e SKUs sem correspondência aparecem na página de promoções. As promoções agendadas também são refletidas no catálogo do site e expiram automaticamente. Produtos por variante não são sincronizados.
+Quando a internet cair, o PDV continua registrando vendas, cancelamentos, entradas, saídas e ajustes localmente no SQLite; as operações da unidade configurada são colocadas numa fila persistente e enviadas automaticamente ao site quando a conexão voltar. Uma falha de rede não desfaz a venda nem a baixa local do estoque. O reenvio é idempotente, então repetir um evento não duplica o movimento no site. Em **Promoções**, administradores e gerentes podem acompanhar a fila e usar **Tentar novamente**; erros e SKUs sem correspondência ficam visíveis ali. Cadastre e importe os produtos enquanto estiver online, para que seus códigos compartilhados estejam disponíveis no PDV antes de operar desconectado. O cadastro de um produto novo ainda exige conexão para reservar o SKU e o código de barras centrais.
+
+Pedidos de teste do site são consultados a cada ciclo de sincronização, aplicados de modo idempotente e confirmados ao Laravel; se o estoque local for insuficiente, o pedido permanece pendente e o PDV não permite que o saldo fique negativo. Cadastros e importações são repetidos com segurança quando houver falha de rede, e produtos importados não são reenviados ao site. As promoções agendadas também são refletidas no catálogo do site e expiram automaticamente. Produtos e seus tamanhos/estoques por variação são sincronizados entre o site e o PDV.
 
 O checkout do site está em **modo temporário de teste**: não processa pagamentos nem movimenta o caixa do PDV. Os pedidos recebidos são registrados separadamente das vendas presenciais, identificados no relatório mensal e geram movimentações de saída de estoque; seus valores não são contabilizados como pagamentos ou dinheiro recebido. Remova ou substitua esse fluxo ao integrar um provedor de pagamentos real.
 

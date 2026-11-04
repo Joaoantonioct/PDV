@@ -38,8 +38,8 @@ test("configuração, autenticação, venda, estoque, cancelamento e fechamento 
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   context.after(async () => {
     await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    await new Promise((resolve) => setTimeout(resolve, 100));
     server.database.close();
-    await new Promise((resolve) => setTimeout(resolve, 50));
     await new Promise((resolve, reject) => site.close((error) => error ? reject(error) : resolve()));
   });
 
@@ -99,6 +99,26 @@ test("configuração, autenticação, venda, estoque, cancelamento e fechamento 
   });
   assert.equal(secondBranch.response.status, 201);
 
+  const brand = await request("/api/brands", {
+    method: "POST",
+    body: { name: "  mARCA   de bRINQUEDOS " },
+  });
+  assert.equal(brand.response.status, 201);
+  assert.equal(brand.payload.name, "Marca De Brinquedos");
+  const category = await request("/api/categories", {
+    method: "POST",
+    body: { name: "  BRINQUEDOS " },
+  });
+  assert.equal(category.response.status, 201);
+  assert.equal(category.payload.name, "Brinquedos");
+  const subcategory = await request("/api/categories", {
+    method: "POST",
+    body: { name: "  BONECAS   E JOGOS ", parentId: category.payload.id },
+  });
+  assert.equal(subcategory.response.status, 201);
+  assert.equal(subcategory.payload.name, "Bonecas E Jogos");
+  assert.equal(subcategory.payload.parent_id, category.payload.id);
+
   const missingCsrf = await fetch(`${baseUrl}/api/cash/open`, {
     method: "POST",
     headers: { Cookie: cookie, "Content-Type": "application/json" },
@@ -106,15 +126,22 @@ test("configuração, autenticação, venda, estoque, cancelamento e fechamento 
   });
   assert.equal(missingCsrf.status, 403);
 
+  const productDescription = "Descrição detalhada do produto. ".repeat(32).slice(0, 1000);
   const product = await request("/api/products", {
     method: "POST",
     body: {
-      branchId: 1, name: "Café", category: "Bebidas",
+      branchId: 1, name: "cAFÉ", category: "Bebidas",
+      brandId: brand.payload.id, categoryId: category.payload.id, sizeType: "none",
+      subcategoryId: subcategory.payload.id,
       priceCents: 1250, costCents: 700, minStock: 1, quantity: 5,
+      description: productDescription,
       imageData: "data:image/jpeg;base64,/9j/2Q==",
     },
   });
   assert.equal(product.response.status, 201);
+  assert.equal(product.payload.name, "Café");
+  assert.equal(product.payload.category_id, subcategory.payload.id);
+  assert.equal(product.payload.size_type, "none");
   assert.equal(product.payload.quantity, 5);
   assert.equal(product.payload.sku, "PDV-000001");
   assert.match(product.payload.barcode, /^2\d{12}$/);
@@ -123,6 +150,121 @@ test("configuração, autenticação, venda, estoque, cancelamento e fechamento 
     sum + digit * (index % 2 === 0 ? 1 : 3), 0);
   assert.equal(barcodeDigits[12], (10 - (barcodeSum % 10)) % 10);
   assert.equal(product.payload.has_image, true);
+  assert.equal(product.payload.description, productDescription);
+  assert.equal(server.database.prepare("SELECT description FROM products WHERE id = ?").get(product.payload.id).description, productDescription);
+  const productList = await request("/api/products?branchId=1");
+  assert.equal(productList.payload.find((item) => item.id === product.payload.id).description, productDescription);
+  const incompleteProduct = await request("/api/products", {
+    method: "POST",
+    body: { branchId: 1, name: "Produto incompleto", priceCents: 500 },
+  });
+  assert.equal(incompleteProduct.response.status, 400);
+  assert.equal(server.database.prepare("SELECT COUNT(*) AS count FROM products").get().count, 1);
+  const mismatchedSizeProduct = await request("/api/products", {
+    method: "POST",
+    body: {
+      branchId: 1,
+      name: "Blusa com tamanho de calça",
+      description: "Descrição válida.",
+      brandId: brand.payload.id,
+      categoryId: category.payload.id,
+      subcategoryId: subcategory.payload.id,
+      sizeType: "trousers",
+      condition: "novo",
+      priceCents: 500,
+      costCents: 200,
+      minStock: 0,
+      quantity: 1,
+      variants: [{ size: "M", quantity: 1 }],
+      imageData: "data:image/jpeg;base64,/9j/2Q==",
+    },
+  });
+  assert.equal(mismatchedSizeProduct.response.status, 400);
+  assert.match(mismatchedSizeProduct.payload.error, /tamanhos brasileiros/i);
+  assert.equal(server.database.prepare("SELECT COUNT(*) AS count FROM products").get().count, 1);
+  const trousersProduct = await request("/api/products", {
+    method: "POST",
+    body: {
+      branchId: 1,
+      name: "Calça tamanho 34",
+      description: "Calça com grade numérica.",
+      brandId: brand.payload.id,
+      categoryId: category.payload.id,
+      subcategoryId: subcategory.payload.id,
+      sizeType: "trousers",
+      condition: "novo",
+      priceCents: 500,
+      costCents: 200,
+      minStock: 0,
+      quantity: 0,
+      variants: [{ size: "34", quantity: 1 }],
+      imageData: "data:image/jpeg;base64,/9j/2Q==",
+    },
+  });
+  assert.equal(trousersProduct.response.status, 201);
+  assert.equal(trousersProduct.payload.quantity, 1);
+  assert.equal(trousersProduct.payload.size_type, "trousers");
+  assert.equal(server.database.prepare("SELECT size_type FROM products WHERE id = ?")
+    .get(trousersProduct.payload.id).size_type, "trousers");
+  assert.equal(server.database.prepare("SELECT size FROM product_variants WHERE product_id = ?")
+    .get(trousersProduct.payload.id).size, "34");
+  assert.equal(server.database.prepare("SELECT COUNT(*) AS count FROM products").get().count, 2);
+  const missingImageProduct = await request("/api/products", {
+    method: "POST",
+    body: {
+      branchId: 1,
+      name: "Produto sem imagem",
+      description: "Descrição válida.",
+      brandId: 1,
+      categoryId: 1,
+      subcategoryId: subcategory.payload.id,
+      sizeType: "none",
+      priceCents: 500,
+      costCents: 200,
+      minStock: 0,
+      quantity: 0,
+    },
+  });
+  assert.equal(missingImageProduct.response.status, 400);
+  assert.match(missingImageProduct.payload.error, /imagens/i);
+  assert.equal(server.database.prepare("SELECT COUNT(*) AS count FROM products").get().count, 2);
+  const updatedDescription = "x".repeat(1000);
+  const updatedProduct = await request(`/api/products/${product.payload.id}`, {
+    method: "PUT",
+    body: {
+      name: product.payload.name,
+      brandId: brand.payload.id,
+      categoryId: category.payload.id,
+      subcategoryId: subcategory.payload.id,
+      sizeType: "none",
+      priceCents: 1250,
+      costCents: 700,
+      minStock: 1,
+      description: updatedDescription,
+    },
+  });
+  assert.equal(updatedProduct.response.status, 200);
+  assert.equal(server.database.prepare("SELECT description FROM products WHERE id = ?").get(product.payload.id).description, updatedDescription);
+  const productWithoutDescription = await request(`/api/products/${product.payload.id}`, {
+    method: "PUT",
+    body: {
+      name: product.payload.name,
+      brandId: brand.payload.id,
+      categoryId: category.payload.id,
+      subcategoryId: subcategory.payload.id,
+      sizeType: "none",
+      priceCents: 1250,
+      costCents: 700,
+      minStock: 1,
+    },
+  });
+  assert.equal(productWithoutDescription.response.status, 400);
+  assert.equal(server.database.prepare("SELECT description FROM products WHERE id = ?").get(product.payload.id).description, updatedDescription);
+  const tooLongDescription = await request("/api/products", {
+    method: "POST",
+    body: { branchId: 1, name: "Descrição longa", priceCents: 100, description: `${productDescription}x` },
+  });
+  assert.equal(tooLongDescription.response.status, 400);
   const salesBeforeQr = server.database.prepare("SELECT COUNT(*) AS count FROM sales").get().count;
   const stockBeforeQr = server.database.prepare(
     "SELECT quantity FROM inventory WHERE branch_id = ? AND product_id = ?",
@@ -322,10 +464,67 @@ test("configuração, autenticação, venda, estoque, cancelamento e fechamento 
     },
   });
   assert.equal(duplicateSetup.response.status, 409);
+
+  const coloredProduct = await request("/api/products", {
+    method: "POST",
+    body: {
+      branchId: 1,
+      name: "Calça em duas cores",
+      description: "Variações de cor com estoque separado.",
+      category: "Bebidas",
+      brandId: brand.payload.id,
+      categoryId: category.payload.id,
+      subcategoryId: subcategory.payload.id,
+      sizeType: "trousers",
+      condition: "novo",
+      priceCents: 500,
+      costCents: 200,
+      minStock: 0,
+      quantity: 3,
+      imageData: "data:image/jpeg;base64,/9j/2Q==",
+      colors: [
+        { name: "Preta", imageData: "data:image/jpeg;base64,/9j/2Q==" },
+        { name: "Azul", imageData: "data:image/jpeg;base64,/9j/2Q==" },
+      ],
+      variants: [
+        { color: "Preta", size: "34", quantity: 1 },
+        { color: "Azul", size: "34", quantity: 2 },
+      ],
+    },
+  });
+  assert.equal(coloredProduct.response.status, 201);
+  const coloredProductList = await request("/api/products?branchId=1");
+  const listedColoredProduct = coloredProductList.payload.find((item) => item.id === coloredProduct.payload.id);
+  assert.deepEqual(listedColoredProduct.colors.map((color) => color.name), ["Preta", "Azul"]);
+  assert.deepEqual(listedColoredProduct.variants.map(({ color, size, quantity }) => ({ color, size, quantity })), [
+    { color: "Preta", size: "34", quantity: 1 },
+    { color: "Azul", size: "34", quantity: 2 },
+  ]);
+  const colorSaleCash = await request("/api/cash/open", {
+    method: "POST",
+    body: { branchId: 1, openingCents: 0 },
+  });
+  assert.equal(colorSaleCash.response.status, 201);
+  const colorSale = await request("/api/sales", {
+    method: "POST",
+    body: {
+      branchId: 1,
+      items: [{ productId: coloredProduct.payload.id, variantId: listedColoredProduct.variants[1].id, quantity: 1 }],
+      discountCents: 0,
+      payments: [{ method: "CASH", amountCents: 500, receivedCents: 500 }],
+    },
+  });
+  assert.equal(colorSale.response.status, 201);
+  assert.equal(server.database.prepare("SELECT product_name FROM sale_items WHERE sale_id = ?")
+    .get(colorSale.payload.id).product_name, "Calça Em Duas Cores (Cor Azul, Tamanho 34)");
 });
 
 test("exige integração central antes de cadastrar um produto", async (context) => {
-  const server = createApplication({ dbPath: ":memory:" });
+  const server = createApplication({
+    dbPath: ":memory:",
+    siteSyncUrl: "",
+    siteSyncToken: "",
+  });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   context.after(async () => {
     await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
@@ -392,7 +591,11 @@ test("migra produtos existentes sem alterar seus dados ou códigos já cadastrad
   `);
   legacyDb.close();
 
-  const server = createApplication({ dbPath });
+  const server = createApplication({
+    dbPath,
+    siteSyncUrl: "",
+    siteSyncToken: "",
+  });
   context.after(() => {
     server.database.close();
     rmSync(directory, { recursive: true, force: true });
@@ -400,6 +603,8 @@ test("migra produtos existentes sem alterar seus dados ou códigos já cadastrad
 
   const columns = server.database.prepare("PRAGMA table_info(products)").all();
   assert.ok(columns.some((column) => column.name === "image_data"));
+  assert.ok(columns.some((column) => column.name === "description"));
+  assert.equal(server.database.prepare("SELECT description FROM products WHERE id = 41").get().description, "");
   const generated = server.database.prepare("SELECT sku, barcode FROM products WHERE id = 41").get();
   assert.equal(generated.sku, "PDV-000041");
   assert.match(generated.barcode, /^2\d{12}$/);
@@ -427,6 +632,7 @@ test("sincroniza estoque, preços e promoções pela fila persistente", async (c
     {
       eventId: "site-event-1",
       name: "Importado do site",
+      description: "Descrição recebida do site.",
       category: "Geral",
       sku: "SITE-002",
       barcode: "7890000000017",
@@ -629,19 +835,31 @@ test("sincroniza estoque, preços e promoções pela fila persistente", async (c
 
   const secondBranch = await request("/api/branches", { name: "Loja Norte" });
   assert.equal(secondBranch.response.status, 201);
+  const brand = await request("/api/brands", { name: "Marca de produto" });
+  assert.equal(brand.response.status, 201);
+  const category = await request("/api/categories", { name: "Geral" });
+  assert.equal(category.response.status, 201);
 
   const product = await request("/api/products", {
     branchId: 1,
     name: "Produto vinculado",
+    description: "Descrição sincronizada do PDV.",
+    brandId: brand.payload.id,
+    categoryId: category.payload.id,
+    sizeType: "none",
     sku: "WEB-001",
     category: "Geral",
     priceCents: 1000,
+    costCents: 500,
+    minStock: 1,
     quantity: 5,
+    colors: [{ name: "Preta", imageData: "data:image/jpeg;base64,/9j/2Q==" }],
+    variants: [{ color: "Preta", size: null, quantity: 5 }],
     images: ["data:image/jpeg;base64,/9j/2Q==", "data:image/jpeg;base64,/9j/2Q=="],
   });
   assert.equal(product.response.status, 201);
   assert.equal(product.payload.sku, "SITE-001");
-  assert.equal(allocationCount, 1);
+  assert.equal(allocationCount, 2);
   const candidates = await request("/api/site-sync/products/unlinked", undefined, "GET");
   assert.deepEqual(candidates.payload, { data: [{ id: 61, name: "Produto correspondente", linked: false }] });
   const linked = await request("/api/site-sync/products/link", {
@@ -659,9 +877,16 @@ test("sincroniza estoque, preços e promoções pela fila persistente", async (c
   const failedCreate = await request("/api/products", {
     branchId: 1,
     name: "Não deve ser salvo",
+    description: "Cadastro pendente de identificadores.",
+    brandId: brand.payload.id,
+    categoryId: category.payload.id,
+    sizeType: "none",
     category: "Geral",
     priceCents: 500,
+    costCents: 200,
+    minStock: 0,
     quantity: 0,
+    images: ["data:image/jpeg;base64,/9j/2Q=="],
   });
   assert.equal(failedCreate.response.status, 503);
   assert.equal(server.database.prepare("SELECT COUNT(*) AS count FROM products").get().count, countBeforeFailedCreate);
@@ -678,13 +903,16 @@ test("sincroniza estoque, preços e promoções pela fila persistente", async (c
   await waitForEvents(1);
   assert.ok(events.every((event) => event.authorization === `Bearer ${syncToken}`));
   assert.equal(events[0].path, "/api/pdv/products");
-  assert.equal(events[0].body.name, "Produto vinculado");
+  assert.equal(events[0].body.name, "Produto Vinculado");
+  assert.equal(events[0].body.description, "Descrição sincronizada do PDV.");
   assert.equal(events[0].body.category, "Geral");
   assert.equal(events[0].body.sku, "SITE-001");
   assert.equal(events[0].body.barcode, product.payload.barcode);
   assert.equal(events[0].body.priceCents, 1000);
   assert.equal(events[0].body.quantity, 5);
   assert.equal(events[0].body.images.length, 2);
+  assert.equal(events[0].body.productId, product.payload.id);
+  assert.equal(events[0].body.colors[0].imageData, "data:image/jpeg;base64,/9j/2Q==");
   assert.ok(events[0].body.eventId);
 
   const importDeadline = Date.now() + 7000;
@@ -721,11 +949,12 @@ test("sincroniza estoque, preços e promoções pela fila persistente", async (c
   );
   assert.equal(filteredSiteReport.payload.site_order_count, 1);
   assert.equal(filteredSiteReport.payload.site_order_total_cents, 750);
-  const imported = server.database.prepare(`SELECT p.id, p.name, p.image_data, i.quantity
+  const imported = server.database.prepare(`SELECT p.id, p.name, p.description, p.image_data, i.quantity
     FROM products p JOIN inventory i ON i.product_id = p.id AND i.branch_id = 1
     WHERE p.sku = ?`).get("SITE-002");
   assert.ok(imported);
-  assert.equal(imported.name, "Importado do site");
+  assert.equal(imported.name, "Importado Do Site");
+  assert.equal(imported.description, "Descrição recebida do site.");
   assert.equal(imported.quantity, 7);
   assert.equal(imported.image_data, siteMainImageData);
   const legacyProduct = server.database.prepare(`SELECT p.name, p.barcode, p.category, p.price_cents, i.quantity
@@ -760,9 +989,11 @@ test("sincroniza estoque, preços e promoções pela fila persistente", async (c
 
   const opened = await request("/api/cash/open", { branchId: 1, openingCents: 0 });
   assert.equal(opened.response.status, 201);
+  const productVariantId = server.database.prepare("SELECT id FROM product_variants WHERE product_id = ?")
+    .get(product.payload.id).id;
   const sale = await request("/api/sales", {
     branchId: 1,
-    items: [{ productId: product.payload.id, quantity: 1 }],
+    items: [{ productId: product.payload.id, variantId: productVariantId, quantity: 1 }],
     payments: [{ method: "CASH", amountCents: 800, receivedCents: 800 }],
   });
   assert.equal(sale.response.status, 201);
@@ -775,5 +1006,127 @@ test("sincroniza estoque, preços e promoções pela fila persistente", async (c
     && Date.now() < outboxDeadline) {
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
+  assert.equal(server.database.prepare("SELECT COUNT(*) AS count FROM site_sync_outbox").get().count, 0);
+});
+
+test("registra vendas offline e sincroniza o estoque quando o site volta", async (context) => {
+  let siteAvailable = false;
+  const receivedEvents = [];
+  const site = createServer(async (request, response) => {
+    let data = "";
+    request.setEncoding("utf8");
+    for await (const chunk of request) data += chunk;
+    const body = data ? JSON.parse(data) : {};
+    response.setHeader("Content-Type", "application/json");
+
+    if (request.url === "/api/pdv/products/pending") {
+      return response.end(JSON.stringify({ data: [] }));
+    }
+    if (request.url === "/api/pdv/site-orders/pending") {
+      return response.end(JSON.stringify({ data: [] }));
+    }
+    if (request.url.startsWith("/api/pdv/site-orders/history")) {
+      const afterId = Number(new URL(request.url, "http://site").searchParams.get("afterId"));
+      return response.end(JSON.stringify({ data: [], nextCursor: afterId }));
+    }
+    if (request.url === "/api/pdv/sync") {
+      if (!siteAvailable) {
+        response.writeHead(503);
+        return response.end(JSON.stringify({ message: "Site temporariamente indisponível." }));
+      }
+      receivedEvents.push(body);
+    }
+    return response.end(JSON.stringify({ received: true }));
+  });
+  await new Promise((resolve) => site.listen(0, "127.0.0.1", resolve));
+  const server = createApplication({
+    dbPath: ":memory:",
+    siteSyncUrl: `http://127.0.0.1:${site.address().port}/api/pdv/sync`,
+    siteSyncToken: "a".repeat(64),
+    siteSyncBranchName: "Unidade principal",
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  context.after(async () => {
+    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    server.database.close();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await new Promise((resolve, reject) => site.close((error) => error ? reject(error) : resolve()));
+  });
+
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  let cookie = "";
+  let csrf = "";
+  const request = async (path, body, method = "POST") => {
+    const response = await fetch(`${baseUrl}${path}`, {
+      method,
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        ...(cookie ? { Cookie: cookie, "X-CSRF-Token": csrf } : {}),
+      },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    return { response, payload: await response.json() };
+  };
+
+  const setup = await request("/api/setup", {
+    name: "Pessoa Administradora",
+    username: "admin",
+    password: "senha-local-segura-123",
+    branchName: "Unidade principal",
+  });
+  assert.equal(setup.response.status, 201);
+  const login = await request("/api/auth/login", {
+    username: "admin",
+    password: "senha-local-segura-123",
+  });
+  assert.equal(login.response.status, 200);
+  cookie = login.response.headers.getSetCookie()[0].split(";")[0];
+  csrf = login.payload.csrfToken;
+
+  const productId = Number(server.database.prepare(`
+    INSERT INTO products (name, sku, barcode, category, price_cents)
+    VALUES ('Produto local', 'PDV-000123', '2000000000123', 'Geral', 500)
+  `).run().lastInsertRowid);
+  server.database.prepare("INSERT INTO inventory (branch_id, product_id, quantity) VALUES (1, ?, 5)")
+    .run(productId);
+  const opened = await request("/api/cash/open", { branchId: 1, openingCents: 0 });
+  assert.equal(opened.response.status, 201);
+
+  const sale = await request("/api/sales", {
+    branchId: 1,
+    items: [{ productId, quantity: 2 }],
+    payments: [{ method: "CASH", amountCents: 1000, receivedCents: 1000 }],
+  });
+  assert.equal(sale.response.status, 201);
+  assert.equal(server.database.prepare("SELECT quantity FROM inventory WHERE branch_id = 1 AND product_id = ?")
+    .get(productId).quantity, 3);
+  assert.equal(server.database.prepare("SELECT COUNT(*) AS count FROM sales").get().count, 1);
+  assert.equal(server.database.prepare("SELECT COUNT(*) AS count FROM site_sync_outbox").get().count, 1);
+  const queuedEventId = server.database.prepare("SELECT event_id FROM site_sync_outbox LIMIT 1").get().event_id;
+
+  const waitUntil = async (predicate, message) => {
+    const deadline = Date.now() + 8000;
+    while (!predicate() && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assert.ok(predicate(), message);
+  };
+  await waitUntil(
+    () => server.database.prepare("SELECT attempts FROM site_sync_outbox LIMIT 1").get()?.attempts > 0,
+    "A falha de conexão não foi registrada na fila local.",
+  );
+  siteAvailable = true;
+  await waitUntil(() => receivedEvents.length === 1, "A fila não foi enviada quando o site voltou.");
+
+  assert.equal(receivedEvents[0].eventId, queuedEventId);
+  assert.equal(receivedEvents[0].type, "inventory.delta");
+  assert.equal(receivedEvents[0].payload.sku, "PDV-000123");
+  assert.equal(receivedEvents[0].payload.delta, -2);
+  assert.equal(receivedEvents[0].payload.reason, "Venda");
+  await waitUntil(
+    () => server.database.prepare("SELECT COUNT(*) AS count FROM site_sync_outbox").get().count === 0,
+    "O evento confirmado pelo site não foi removido da fila.",
+  );
   assert.equal(server.database.prepare("SELECT COUNT(*) AS count FROM site_sync_outbox").get().count, 0);
 });

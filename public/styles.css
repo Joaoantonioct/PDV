@@ -15,7 +15,7 @@
 
 * { box-sizing: border-box; }
 body { margin: 0; min-width: 320px; background: var(--canvas); color: var(--ink); }
-button, input, select { font: inherit; }
+button, input, select, textarea { font: inherit; }
 button { cursor: pointer; }
 .hidden { display: none !important; }
 .muted { color: var(--muted); }
@@ -31,7 +31,8 @@ button { cursor: pointer; }
 .stack { display: grid; gap: 16px; margin-top: 24px; }
 label { display: grid; gap: 7px; color: #43514c; font-size: 13px; font-weight: 650; }
 input, select { width: 100%; min-height: 42px; padding: 9px 12px; border: 1px solid #dce3df; border-radius: 9px; outline: none; background: white; color: var(--ink); }
-input:focus, select:focus { border-color: #53a285; box-shadow: 0 0 0 3px rgb(83 162 133 / 14%); }
+textarea { width: 100%; min-height: 100px; padding: 9px 12px; border: 1px solid #dce3df; border-radius: 9px; outline: none; background: white; color: var(--ink); resize: vertical; }
+input:focus, select:focus, textarea:focus { border-color: #53a285; box-shadow: 0 0 0 3px rgb(83 162 133 / 14%); }
 .hint { margin: -8px 0 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
 .button { min-height: 40px; display: inline-flex; align-items: center; justify-content: center; gap: 8px; padding: 9px 15px; border: 1px solid transparent; border-radius: 9px; font-weight: 700; transition: background .15s, transform .15s; }
 .button:active { transform: translateY(1px); }
@@ -165,6 +166,24 @@ input:focus, select:focus { border-color: #53a285; box-shadow: 0 0 0 3px rgb(83 
 .checkout { width: 100%; margin-top: 15px; }
 .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
 .form-grid .wide { grid-column: 1 / -1; }
+.product-size-options { display: grid; grid-template-columns: repeat(auto-fill, minmax(115px, 1fr)); gap: 8px; }
+.product-size-option { display: grid; grid-template-columns: 16px 1fr 54px; align-items: center; gap: 6px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 7px; background: white; font-size: 11px; }
+.product-size-option input[type="checkbox"] { margin: 0; accent-color: var(--green); }
+.product-size-option input[type="number"] { width: 54px; min-height: 28px; padding: 3px 4px; font-size: 10px; }
+.product-color-field { display: grid; gap: 12px; }
+.product-color-heading,
+.product-color-card-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.product-color-heading .hint { margin: 4px 0 0; }
+.product-color-options { display: grid; gap: 10px; }
+.product-color-card { display: grid; gap: 10px; padding: 12px; border: 1px solid var(--line); border-radius: 9px; background: #fbfcfd; }
+.product-color-card-heading > label { flex: 1; }
+.product-color-image-label { display: grid; max-width: 420px; gap: 5px; }
+.product-color-preview { width: 82px; height: 82px; object-fit: cover; border: 1px solid var(--line); border-radius: 7px; background: #fff; }
+.product-color-sizes { margin-top: 0; }
+.product-color-sizes .product-size-option { grid-template-columns: 16px 1fr 54px; }
+.size-stock-list { display: grid; gap: 5px; font-size: 11px; }
+.size-stock-list > span { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.size-stock-list small { flex: 1 1 100%; color: var(--muted); font-size: 9px; }
 .image-file-label input { min-height: 38px; padding: 7px; }
 .product-image-editor { display: flex; align-items: center; gap: 16px; }
 .product-image-editor-preview { width: 112px; height: 88px; display: grid; flex: 0 0 112px; place-items: center; overflow: hidden; border: 1px dashed #cbd8d1; border-radius: 10px; background: #f6f9f7; color: var(--muted); font-size: 11px; }
@@ -259,6 +278,7 @@ td strong { font-weight: 700; }
 .sales-history-dialog #salesHistoryBody { max-height: 64vh; overflow: auto; }
 .password-dialog::backdrop { background: rgb(17 35 29 / 48%); }
 .password-dialog .stack { margin-top: 0; }
+.input-dialog::backdrop { background: rgb(17 35 29 / 54%); }
 .dialog-heading { display: flex; align-items: start; justify-content: space-between; gap: 12px; }
 .dialog-heading h2 { margin: 0; font-size: 20px; }
 .dialog-heading .eyebrow { margin: 0 0 5px; }

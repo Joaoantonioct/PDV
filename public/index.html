@@ -103,11 +103,23 @@
     <form id="transferForm" class="stack">
       <div class="dialog-heading"><div><p class="eyebrow">ESTOQUE</p><h2>Transferir produto</h2></div><button id="closeTransferDialog" class="button ghost small-button" type="button" aria-label="Fechar">×</button></div>
       <input name="productId" type="hidden">
+      <input name="variantId" type="hidden">
       <p id="transferProductName" class="muted"></p>
       <label>Unidade de destino<select name="targetBranchId" required></select></label>
       <label>Quantidade<input name="quantity" type="number" min="1" step="1" required></label>
       <label>Motivo/observação<input name="note" maxlength="200" required></label>
       <div class="form-actions"><button class="button primary" type="submit">Confirmar transferência</button></div>
+    </form>
+  </dialog>
+  <dialog id="inputDialog" class="password-dialog input-dialog">
+    <form id="inputDialogForm" class="stack">
+      <div class="dialog-heading"><div><p class="eyebrow">PDV</p><h2 id="inputDialogTitle"></h2></div><button id="closeInputDialog" class="button ghost small-button" type="button" aria-label="Cancelar">×</button></div>
+      <label id="inputDialogLabel" for="inputDialogValue"></label>
+      <input id="inputDialogValue" name="value" maxlength="200" autocomplete="off">
+      <div class="form-actions">
+        <button id="cancelInputDialog" class="button secondary" type="button">Cancelar</button>
+        <button class="button primary" type="submit">Confirmar</button>
+      </div>
     </form>
   </dialog>
 </body>
