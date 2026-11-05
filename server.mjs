@@ -2505,6 +2505,9 @@ function createApplication({
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  const envPath = resolve(ROOT, ".env");
+  if (existsSync(envPath)) process.loadEnvFile(envPath);
+
   const server = createApplication();
   const port = Number(process.env.PORT ?? 3000);
   const host = "0.0.0.0";

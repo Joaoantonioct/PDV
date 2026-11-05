@@ -84,16 +84,19 @@ Em hospedagens gerenciadas, use a porta fornecida pela plataforma e permita que 
 O PDV compartilha cadastros de produtos com o site e envia preços, promoções e movimentações de estoque para a API Laravel. Os produtos criados no site são importados pelo PDV; produtos existentes só são associados após uma escolha explícita na tela de conciliação. A sincronização de estoque e preços continua partindo do PDV para a unidade configurada. Pedidos temporários de teste finalizados no site são consultados pelo PDV e baixados da unidade configurada; entram no relatório como pedidos identificados do site e geram movimentações de estoque, mas não criam recebimentos nem alteram o caixa. O PDV também reconcilia o histórico paginado para incluir pedidos que já tinham sido confirmados antes dessa integração com relatórios.
 
 1. No projeto `C:\projeto\LDM`, configure `PDV_SYNC_TOKEN` no `.env` com um segredo aleatório de pelo menos 32 caracteres e execute `php artisan migrate --force`. Não use nem compartilhe esse token em mensagens ou no código.
-2. No servidor do PDV, configure as variáveis de ambiente antes de iniciar. Use o mesmo token:
+2. No computador onde o PDV roda, configure `C:\pdv\.env` com o domínio público do site e o mesmo token:
 
-   ```powershell
-   $env:PDV_SITE_SYNC_URL = "https://seu-site.com"
-   $env:PDV_SITE_SYNC_TOKEN = "<o mesmo segredo configurado no Laravel>"
-   $env:PDV_SITE_SYNC_BRANCH_NAME = "Unidade principal"
-   npm start
+   ```dotenv
+   PDV_SITE_SYNC_URL=https://seu-site.com
+   PDV_SITE_SYNC_TOKEN=seu-token-secreto-de-pelo-menos-32-caracteres
+   PDV_SITE_SYNC_BRANCH_NAME=Unidade principal
    ```
 
-   Para desenvolvimento local na mesma máquina, use `http://127.0.0.1:8000`. O PDV deriva os caminhos `/api/pdv/...` dessa URL; uma URL terminada em `/api/pdv/sync` também é aceita. Fora do computador local, HTTPS é obrigatório.
+   O comando `npm start`, executado dentro de `C:\pdv`, carrega esse arquivo automaticamente. Substitua `https://seu-site.com` pelo domínio HTTPS real; não use `localhost`, `127.0.0.1` nem o endereço local do Laravel para acessar a Hostinger. Para desenvolvimento com o site na mesma máquina, pode usar `http://127.0.0.1:8000`. O PDV deriva os caminhos `/api/pdv/...` da URL; uma URL terminada em `/api/pdv/sync` também é aceita. Fora do computador local, HTTPS é obrigatório.
+
+   No painel/terminal da Hostinger, confirme que `PDV_SYNC_TOKEN` tem exatamente o mesmo valor e que a migration foi aplicada. Depois de alterar o `.env` do Laravel, execute `php artisan config:clear` (e `php artisan config:cache`, se a hospedagem usar cache de configuração). Reinicie o PDV após alterar seu `.env`.
+
+   Para conferir o enlace, abra **Promoções** no PDV e verifique se a sincronização está habilitada e se a fila não mostra erro. O PDV consulta os produtos novos do site periodicamente e envia atualizações à API; não é necessário abrir uma porta de entrada no computador do caixa. Produtos que já existiam antes da integração devem ser vinculados explicitamente em **Produtos e estoque**.
 3. Com a integração ativa, ao cadastrar um produto no PDV o servidor obtém SKU e código de barras centrais antes de salvar. Se o site estiver indisponível ou não estiver configurado, o produto não será criado. Cadastros feitos no site são importados periodicamente a partir do campo `data` da API; o estoque inicial recebido é aplicado apenas à unidade configurada no PDV. Se o SKU já existir no PDV com outro código de barras, o produto existente não é sobrescrito e a importação fica pendente para correção.
 4. Para produtos que já existem nos dois sistemas, um administrador ou gerente pode abrir **Produtos e estoque**, comparar os nomes e selecionar explicitamente o correspondente no site. Nenhum vínculo ou alteração de códigos é feito automaticamente pelo nome. SKU e código de barras permanecem visíveis na lista local.
 5. Confira as quantidades na unidade configurada. Em **Promoções**, o administrador pode usar **Alinhar estoque e preços iniciais** para substituir no site os saldos e preços pelos valores atuais do PDV.
