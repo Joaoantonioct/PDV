@@ -421,6 +421,11 @@ function createApplication({
     const violations = db.prepare("PRAGMA foreign_key_check").all();
     if (violations.length) throw new Error("A migração de variações deixou referências de banco inválidas.");
   }
+  const refreshedVariantColumns = db.prepare("PRAGMA table_info(product_variants)").all();
+  if (!refreshedVariantColumns.some((column) => column.name === "price_cents")) {
+    db.exec("ALTER TABLE product_variants ADD COLUMN price_cents INTEGER");
+  }
+
   for (const table of ["sale_items", "site_sale_items"]) {
     const columns = db.prepare(`PRAGMA table_info(${table})`).all();
     if (!columns.some((column) => column.name === "variant_id")) {
@@ -513,6 +518,7 @@ function createApplication({
         color: optionalText(variant.color, "Cor da variação", 50),
         sku: exactIdentifier(variant.sku, "SKU da variação"),
         barcode: exactIdentifier(variant.barcode, "Código de barras da variação"),
+        priceCents: variant.priceCents == null || variant.priceCents === "" ? null : money(variant.priceCents, "Preço da variação"),
         quantity: variant.quantity,
       };
     });
@@ -582,10 +588,10 @@ function createApplication({
       }
       const colorId = colorIds.get(variant.color.toLocaleLowerCase("pt-BR")) ?? null;
       const saved = existing
-        ? db.prepare("UPDATE product_variants SET color_id = ?, size = ?, barcode = ?, active = 1 WHERE id = ? RETURNING id")
-          .get(colorId, variant.size, variant.barcode, existing.id)
-        : db.prepare(`INSERT INTO product_variants (product_id, color_id, size, sku, barcode)
-          VALUES (?, ?, ?, ?, ?) RETURNING id`).get(productId, colorId, variant.size, variant.sku, variant.barcode);
+        ? db.prepare("UPDATE product_variants SET color_id = ?, size = ?, barcode = ?, price_cents = ?, active = 1 WHERE id = ? RETURNING id")
+          .get(colorId, variant.size, variant.barcode, variant.priceCents, existing.id)
+        : db.prepare(`INSERT INTO product_variants (product_id, color_id, size, sku, barcode, price_cents)
+          VALUES (?, ?, ?, ?, ?, ?) RETURNING id`).get(productId, colorId, variant.size, variant.sku, variant.barcode, variant.priceCents);
       db.prepare(`INSERT OR IGNORE INTO inventory_variants (branch_id, variant_id, quantity)
         SELECT id, ?, 0 FROM branches`).run(saved.id);
       db.prepare("UPDATE inventory_variants SET quantity = ? WHERE branch_id = ? AND variant_id = ?")
@@ -700,6 +706,7 @@ function createApplication({
           WHERE p.sku = ? COLLATE NOCASE AND p.active = 1`).get(branch.id, sku);
         if (!product) throw new HttpError(404, `Produto com SKU ${sku} não encontrado nesta unidade.`);
         const stock = variant?.stock ?? product.stock;
+        const unitPriceCents = variant?.price_cents ?? product.price_cents;
         if (!legacyReceipt && stock < quantity) {
           throw new HttpError(409, `Estoque insuficiente no PDV para ${product.name}${variant?.color ? ` na cor ${variant.color}` : ""}${variant?.size ? ` no tamanho ${variant.size}` : ""}.`);
         }
@@ -1172,6 +1179,17 @@ function createApplication({
             sku: product.sku,
             priceCents: product.price_cents,
           });
+          const variants = db.prepare(
+            "SELECT id, sku, price_cents FROM product_variants WHERE product_id = ? AND active = 1"
+          ).all(product.id);
+          for (const variant of variants) {
+            enqueueSiteEvent("product.variant.price", {
+              productId: product.id,
+              variantId: variant.id,
+              sku: variant.sku,
+              priceCents: variant.price_cents,
+            });
+          }
         }
       });
       setTimeout(() => { void flushSiteSync(); }, 0);
@@ -1433,7 +1451,7 @@ function createApplication({
       `).all(branchId, query, query, query, query);
       return sendJson(response, 200, products.map((product) => ({
         ...product,
-        variants: db.prepare(`SELECT v.id, v.size, v.sku, v.barcode, iv.quantity, c.name AS color
+        variants: db.prepare(`SELECT v.id, v.size, v.sku, v.barcode, v.price_cents, iv.quantity, c.name AS color
           FROM product_variants v JOIN inventory_variants iv ON iv.variant_id = v.id
           LEFT JOIN product_colors c ON c.id = v.color_id
           WHERE v.product_id = ? AND v.active = 1 AND iv.branch_id = ?
@@ -1543,7 +1561,8 @@ function createApplication({
           || (sizeType !== "none" && !allowedSizes.includes(variant.size))
           || (sizeType === "none" && (variant.size ?? "") !== "")
           || (normalizedColors.length && typeof variant.color !== "string")
-          || !isInteger(variant.quantity)) {
+          || !isInteger(variant.quantity)
+          || (variant.priceCents !== undefined && variant.priceCents !== null && variant.priceCents !== "" && !isInteger(variant.priceCents))) {
           throw new HttpError(400, "Informe combinações de cor, tamanho e estoque válidas.");
         }
         const color = optionalText(variant.color, "Cor da variação", 50);
@@ -1555,7 +1574,7 @@ function createApplication({
         const combination = `${color.toLocaleLowerCase("pt-BR")}|${size}`;
         if (seenCombinations.has(combination)) throw new HttpError(400, "Não repita a combinação de cor e tamanho.");
         seenCombinations.add(combination);
-        return { color, size, quantity: variant.quantity };
+        return { color, size, quantity: variant.quantity, priceCents: variant.priceCents === undefined || variant.priceCents === null || variant.priceCents === "" ? null : variant.priceCents };
       });
       if (hasSizeVariants && !variants.length) {
         throw new HttpError(400, hasSizeVariants
@@ -1604,9 +1623,9 @@ function createApplication({
         }
         for (const variant of sizedVariants) {
           const colorId = colorIds.get(variant.color.toLocaleLowerCase("pt-BR")) ?? null;
-          const createdVariant = db.prepare(`INSERT INTO product_variants (product_id, color_id, size, sku, barcode)
-            VALUES (?, ?, ?, ?, ?) RETURNING id`)
-            .get(result.id, colorId, variant.size, variant.sku, variant.barcode);
+          const createdVariant = db.prepare(`INSERT INTO product_variants (product_id, color_id, size, sku, barcode, price_cents)
+            VALUES (?, ?, ?, ?, ?, ?) RETURNING id`)
+            .get(result.id, colorId, variant.size, variant.sku, variant.barcode, variant.priceCents);
           db.prepare(`INSERT INTO inventory_variants (branch_id, variant_id, quantity)
             SELECT id, ?, 0 FROM branches WHERE active = 1`).run(createdVariant.id);
           db.prepare("UPDATE inventory_variants SET quantity = ? WHERE branch_id = ? AND variant_id = ?")
@@ -1696,6 +1715,15 @@ function createApplication({
         throw new HttpError(400, "O tipo de peça não pode ser alterado após o cadastro do produto.");
       }
       if (!imageData && !currentProduct.image_data) throw new HttpError(400, "Adicione uma imagem para o produto.");
+
+      const variantPrices = body.variantPrices === undefined ? [] : body.variantPrices;
+      if (!Array.isArray(variantPrices)) throw new HttpError(400, "Lista de preços individuais inválida.");
+      const seenVariantIds = new Set();
+      for (const entry of variantPrices) {
+        if (!entry || typeof entry !== "object" || Array.isArray(entry) || !isInteger(entry.variantId, 1) || !(entry.priceCents === null || (isInteger(entry.priceCents) && entry.priceCents <= 2147483647))) throw new HttpError(400, "Preço individual ou variação inválida.");
+        if (seenVariantIds.has(entry.variantId)) throw new HttpError(400, "Variação enviada mais de uma vez.");
+        seenVariantIds.add(entry.variantId);
+      }
       transaction(() => {
         const existing = db.prepare("SELECT sku FROM products WHERE id = ? AND active = 1").get(id);
         if (!existing) throw new HttpError(404, "Produto não encontrado.");
@@ -1718,6 +1746,14 @@ function createApplication({
           costCents: cost,
           ...(description === undefined ? {} : { description }),
         });
+
+        for (const entry of variantPrices) {
+          const variant = db.prepare("SELECT id, sku FROM product_variants WHERE id = ? AND product_id = ? AND active = 1").get(entry.variantId, id);
+          if (!variant) throw new HttpError(400, "Variação não pertence a este produto ou está inativa: " + entry.variantId);
+          const updated = db.prepare("UPDATE product_variants SET price_cents = ? WHERE id = ? AND product_id = ? AND active = 1").run(entry.priceCents, entry.variantId, id);
+          if (Number(updated.changes) !== 1) throw new HttpError(409, "Não foi possível atualizar o preço da variação.");
+          enqueueSiteEvent("product.variant.price", { productId: id, variantId: entry.variantId, sku: variant.sku, priceCents: entry.priceCents });
+        }
       });
       return sendJson(response, 200, { updated: true });
     }
@@ -2040,7 +2076,7 @@ function createApplication({
         let variant = null;
         if (hasVariants) {
           if (variantId === null) throw new HttpError(400, `Selecione o tamanho de ${product.name}.`);
-          variant = db.prepare(`SELECT v.id, v.size, v.sku, c.name AS color, iv.quantity AS stock
+          variant = db.prepare(`SELECT v.id, v.size, v.sku, v.price_cents, c.name AS color, iv.quantity AS stock
             FROM product_variants v JOIN inventory_variants iv ON iv.variant_id = v.id
             LEFT JOIN product_colors c ON c.id = v.color_id
             WHERE v.id = ? AND v.product_id = ? AND v.active = 1 AND iv.branch_id = ?`)
@@ -2050,16 +2086,18 @@ function createApplication({
           throw new HttpError(400, `O produto ${product.name} não possui variações cadastradas.`);
         }
         const stock = variant?.stock ?? product.stock;
+        const unitPriceCents = variant?.price_cents ?? product.price_cents;
         if (stock < item.quantity) throw new HttpError(409, `Estoque insuficiente para ${product.name}${variant?.color ? ` na cor ${variant.color}` : ""}${variant?.size ? ` no tamanho ${variant.size}` : ""}.`);
         return {
           ...product,
+          price_cents: unitPriceCents,
           variantId: variant?.id ?? null,
           color: variant?.color ?? null,
           size: variant?.size ?? null,
           sku: variant?.sku ?? null,
           stock,
           quantity: item.quantity,
-          totalCents: product.price_cents * item.quantity,
+          totalCents: unitPriceCents * item.quantity,
         };
       });
       const subtotal = items.reduce((sum, item) => sum + item.totalCents, 0);

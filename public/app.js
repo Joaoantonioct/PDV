@@ -373,8 +373,13 @@ function updateProductCategoryFields(variants = null) {
   const currentVariants = variants ?? [...(sizeOptions?.querySelectorAll("[data-size-check]:checked") ?? [])].map((checkbox) => ({
     size: checkbox.value,
     quantity: Number(checkbox.closest("[data-size-row]").querySelector("[data-size-qty]").value || 0),
+    price: checkbox.closest("[data-size-row]").querySelector("[data-size-price]")?.value ?? "",
   }));
-  const selected = new Map(currentVariants.map((variant) => [String(variant.size), Number(variant.quantity ?? variant.qty ?? 0)]));
+  const selected = new Map(currentVariants.map((variant) => {
+    const cents = variant.price_cents ?? variant.priceCents;
+    const price = variant.price ?? (cents == null ? "" : (Number(cents) / 100).toFixed(2));
+    return [String(variant.size), { quantity: Number(variant.quantity ?? variant.qty ?? 0), price: String(price) }];
+  }));
   const sizes = productSizesForType(type);
 
   if (conditionLabel && conditionSelect) {
@@ -397,12 +402,42 @@ function updateProductCategoryFields(variants = null) {
       return `<label class="product-size-option" data-size-row>
         <input type="checkbox" data-size-check value="${size}" ${checked ? "checked" : ""} ${editing ? "disabled" : ""}>
         <span>${size}</span>
-        <input type="number" min="0" max="2147483647" step="1" value="${checked ? selected.get(size) : 0}" data-size-qty aria-label="Estoque tamanho ${size}" ${checked && !editing ? "required" : "disabled"}>
+        <input type="number" min="0" max="2147483647" step="1" value="${checked ? selected.get(size).quantity : 0}" data-size-qty aria-label="Estoque tamanho ${size}" ${checked && !editing ? "required" : "disabled"}>
+        <input type="text" inputmode="decimal" maxlength="12" placeholder="Preço (opcional)" value="${checked ? escapeHtml(selected.get(size).price) : ""}" data-size-price aria-label="Preço individual tamanho ${size}" ${checked && !editing ? "" : "disabled"}>
       </label>`;
     }).join("");
     updateProductSizeTotal();
   }
   renderProductColorRows(editing);
+}
+
+function renderVariantPriceEditor(variants = []) {
+  const editor = $("#productVariantPriceEditor");
+  const container = $("#productVariantPriceOptions");
+  if (!editor || !container) return;
+
+  editor.classList.toggle("hidden", variants.length === 0);
+
+  container.innerHTML = variants.map((variant) => {
+    const label = [variant.color, variant.size]
+      .filter(Boolean)
+      .join(" · ") || "Sem tamanho";
+
+    const price = variant.price_cents == null
+      ? ""
+      : (Number(variant.price_cents) / 100).toFixed(2);
+
+    return `<label class="product-size-option">
+      <span>${escapeHtml(label)}</span>
+      <input type="text"
+        inputmode="decimal"
+        maxlength="12"
+        placeholder="Preço do produto"
+        value="${escapeHtml(price)}"
+        data-variant-price="${variant.id}"
+        aria-label="Preço individual ${escapeHtml(label)}">
+    </label>`;
+  }).join("");
 }
 
 function updateProductSizeTotal() {
@@ -448,9 +483,10 @@ function renderProductColorRows(readOnly = false) {
           <input type="checkbox" data-color-size="${colorIndex}:${size}" ${selected ? "checked" : ""} ${readOnly ? "disabled" : ""}>
           <span>${size}</span>
           <input type="number" min="0" max="2147483647" step="1" value="${selected ? Number(color.quantities[size]) : 0}" data-color-quantity="${colorIndex}:${size}" aria-label="Estoque ${escapeHtml(color.name || `cor ${colorIndex + 1}`)} tamanho ${size}" ${selected && !readOnly ? "required" : "disabled"}>
+          <input type="text" inputmode="decimal" maxlength="12" placeholder="Preço" value="${selected ? escapeHtml(color.prices[size] ?? "") : ""}" data-color-price="${colorIndex}:${size}" aria-label="Preço individual ${escapeHtml(color.name || `cor ${colorIndex + 1}`)} tamanho ${size}" ${selected && !readOnly ? "" : "disabled"}>
         </label>`;
   }).join("")}
-      </div>` : `<label>Estoque desta cor *<input type="number" min="0" max="2147483647" step="1" value="${Number(color.quantity ?? 0)}" data-color-quantity="${colorIndex}:" ${readOnly ? "disabled" : "required"}></label>`}
+      </div>` : `<label>Estoque desta cor *<input type="number" min="0" max="2147483647" step="1" value="${Number(color.quantity ?? 0)}" data-color-quantity="${colorIndex}:" ${readOnly ? "disabled" : "required"}></label><label>Preço individual (opcional)<input type="text" inputmode="decimal" maxlength="12" placeholder="Preço" value="${escapeHtml(color.price ?? "")}" data-color-price="${colorIndex}:" ${readOnly ? "disabled" : ""}></label>`}
     </section>`).join("");
   updateProductColorTotal();
 }
@@ -477,7 +513,9 @@ function makeProductColorRow(color = {}) {
     imageData: color.imageData ?? null,
     imagePromise: Promise.resolve(),
     quantities: { ...(color.quantities ?? {}) },
+    prices: { ...(color.prices ?? {}) },
     quantity: Number(color.quantity ?? 0),
+    price: String(color.price ?? ""),
   };
 }
 
@@ -786,6 +824,12 @@ async function renderProducts() {
           <div class="product-color-heading"><div><strong>Cores do produto</strong><p class="hint">Adicione uma foto para cada cor; o estoque será individual por cor e tamanho.</p></div>
             <button class="button secondary small-button" type="button" data-action="add-product-color">Adicionar cor</button></div>
           <div id="productColorOptions" class="product-color-options"></div>
+        </div>
+
+        <div id="productVariantPriceEditor" class="wide hidden">
+          <strong>Preços individuais das variações</strong>
+          <p class="hint">Informe um preço para cada variação ou deixe vazio para usar o preço do produto.</p>
+          <div id="productVariantPriceOptions" class="product-size-options"></div>
         </div>
         <p id="productStockTotal" class="hint wide hidden" role="status" aria-live="polite"></p>
         <label class="wide image-file-label">Imagens do produto (até 10) *
@@ -1880,13 +1924,23 @@ async function handleSubmit(event) {
         minStock: Number(value("minStock")),
         condition: value("condition") || null,
       };
+      if (productId) {
+        product.variantPrices = [...form.querySelectorAll("[data-variant-price]")].map(field => {
+          const raw = field.value.trim(), priceCents = raw === "" ? null : parseMoney(raw), variantId = Number(field.dataset.variantPrice);
+          if ((raw !== "" && priceCents === null) || !Number.isSafeInteger(variantId) || variantId < 1) throw new Error("Preço ou variação inválida.");
+          return { variantId, priceCents };
+        });
+      }
       const sizeMode = !$("#productSizeField").classList.contains("hidden");
       const selectedVariants = sizeMode
         ? [...form.querySelectorAll("[data-size-check]:checked")].map((checkbox) => ({
           size: checkbox.value,
           quantity: Number(checkbox.closest("[data-size-row]").querySelector("[data-size-qty]").value),
+          _priceInput: checkbox.closest("[data-size-row]").querySelector("[data-size-price]")?.value.trim() ?? "", priceCents: (() => { const field = checkbox.closest("[data-size-row]").querySelector("[data-size-price]"); return field?.value.trim() ? parseMoney(field.value) : null; })(),
         }))
         : [];
+      if (selectedVariants.some((variant) => variant._priceInput !== "" && variant.priceCents === null)) throw new Error("Informe um preço válido para cada tamanho.");
+      selectedVariants.forEach((variant) => delete variant._priceInput);
       let colors = [];
       let colorVariants = [];
       if (!productId && state.productColorRows.length) {
@@ -1905,17 +1959,22 @@ async function handleSubmit(event) {
         for (const color of state.productColorRows) {
           const variants = sizes.length
             ? sizes.filter((size) => Object.hasOwn(color.quantities, size))
-              .map((size) => ({ size, quantity: Number(color.quantities[size]) }))
-            : [{ size: null, quantity: Number(color.quantity) }];
+              .map((size) => ({ size, quantity: Number(color.quantities[size]), price: String(color.prices[size] ?? "").trim() }))
+            : [{ size: null, quantity: Number(color.quantity), price: String(color.price ?? "").trim() }];
           if (!variants.length) {
             throw new Error(`Selecione ao menos um tamanho para a cor ${color.name.trim()}.`);
+          }
+          if (variants.some((variant) => variant.price !== "" && parseMoney(variant.price) === null)) {
+            throw new Error(`Informe um preço válido para as variações da cor ${color.name.trim()}.`);
           }
           if (variants.some((variant) => !Number.isSafeInteger(variant.quantity)
             || variant.quantity < 0 || variant.quantity > 2147483647)) {
             throw new Error(`Informe um estoque inteiro válido para a cor ${color.name.trim()}.`);
           }
           colorVariants.push(...variants.map((variant) => ({
-            ...variant,
+            size: variant.size,
+            quantity: variant.quantity,
+            priceCents: variant.price === "" ? null : parseMoney(variant.price),
             color: color.name.trim(),
           })));
         }
@@ -2286,6 +2345,7 @@ async function handleClick(event) {
       }
 
       updateProductCategoryFields(product.variants ?? []);
+      renderVariantPriceEditor(product.variants ?? []);
       state.productImageData = undefined;
       state.productImagesData = [];
       state.productImagesPromise = Promise.resolve([]);
@@ -2521,6 +2581,15 @@ document.addEventListener("input", (event) => {
       if (size === "") color.quantity = Number(event.target.value || 0);
       else color.quantities[size] = Number(event.target.value || 0);
       updateProductColorTotal();
+    }
+  }
+  if (event.target.matches?.("[data-color-price]")) {
+    const [colorIndex, ...sizeParts] = event.target.dataset.colorPrice.split(":");
+    const color = state.productColorRows[Number(colorIndex)];
+    if (color) {
+      const size = sizeParts.join(":");
+      if (size === "") color.price = event.target.value;
+      else color.prices[size] = event.target.value;
     }
   }
   if (event.target.id === "productDescription") {
