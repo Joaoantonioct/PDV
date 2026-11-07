@@ -473,8 +473,12 @@ function createApplication({
     }
     const result = await response.json().catch(() => ({}));
     if (!response.ok) {
-      throw new HttpError(response.status >= 400 && response.status < 500 ? response.status : 503,
-        result.message ?? result.error ?? `O site respondeu com HTTP ${response.status}.`);
+      const integrationAuthError = response.status === 401 || response.status === 403;
+      const status = integrationAuthError ? 502 : response.status >= 400 && response.status < 500 ? response.status : 503;
+      const message = integrationAuthError
+        ? "O site recusou a autenticação da integração (HTTP " + response.status + "). Confira a URL e o token no menu Ajuda."
+        : result.message ?? result.error ?? "O site respondeu com HTTP " + response.status + ".";
+      throw new HttpError(status, message);
     }
     return result;
   }

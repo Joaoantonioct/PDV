@@ -153,6 +153,14 @@ if (!app.requestSingleInstanceLock()) {
         label: "Ajuda",
         submenu: [
           {
+            label: "Ferramentas do desenvolvedor",
+            click: () => {
+              if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.openDevTools({ mode: "detach" });
+              }
+            },
+          },
+          {
             label: "Abrir configuração de sincronização",
             click: () => {
               if (process.platform === "win32") {
