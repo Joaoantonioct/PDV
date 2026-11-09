@@ -1,0 +1,2806 @@
+const state = {
+  user: null,
+  csrf: "",
+  branches: [],
+  branchId: 0,
+  salesHistory: [],
+  customers: [],
+  products: [],
+  labelProducts: [],
+  labelCopies: {},
+  cart: [],
+  paymentRows: [],
+  customerId: "",
+  selectedProductId: null,
+  searchMatchProductId: null,
+  lastAutoAddedCode: null,
+  productImageData: undefined,
+  productImagesData: [],
+  productImagesPromise: Promise.resolve([]),
+  productImageDirty: false,
+  productColorRows: [],
+  view: "sales",
+  toastTimer: null,
+  skipTestQrOnce: false,
+  simulationSnapshot: null,
+  receiptOffer: null,
+};
+
+const paymentLabels = {
+  CASH: "Dinheiro",
+  PIX: "Pix",
+  DEBIT: "Cartão de débito",
+  CREDIT: "Cartão de crédito",
+  OTHER: "Outro",
+};
+
+const roleLabels = { ADMIN: "Administrador", MANAGER: "Gerente", CASHIER: "Operador" };
+const MAX_LABEL_COPIES = 36;
+const $ = (selector, root = document) => root.querySelector(selector);
+const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
+
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (character) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  })[character]);
+}
+
+function renderPaymentRows() {
+  return state.paymentRows.map((payment, index) => `
+    <div class="payment-row">
+      <label>Forma
+        <select data-payment-method="${index}">
+          ${Object.entries(paymentLabels).map(([method, label]) => `<option value="${method}" ${payment.method === method ? "selected" : ""}>${label}</option>`).join("")}
+        </select>
+      </label>
+      <label>Valor (R$)
+        <input data-payment-amount="${index}" type="number" min="0" step="0.01" value="${(payment.amountCents / 100).toFixed(2)}">
+      </label>
+      ${payment.method === "CASH" ? `<label>Recebido (R$)
+        <input data-payment-received="${index}" type="number" min="0" step="0.01" value="${payment.receivedCents === null ? "" : (payment.receivedCents / 100).toFixed(2)}" placeholder="Igual ao valor">
+      </label>` : ""}
+      ${state.paymentRows.length > 1 ? `<button class="remove-button" type="button" data-action="remove-payment" data-index="${index}">Remover</button>` : ""}
+    </div>`).join("");
+}
+
+function formatMoney(cents) {
+  return new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" })
+    .format((Number(cents) || 0) / 100);
+}
+
+function parseMoney(value) {
+  const normalized = String(value ?? "").trim().replace(/\s/g, "").replace(",", ".");
+  if (!/^\d+(\.\d{0,2})?$/.test(normalized)) return null;
+  const [whole, fraction = ""] = normalized.split(".");
+  const cents = Number(whole) * 100 + Number(fraction.padEnd(2, "0"));
+  return Number.isSafeInteger(cents) ? cents : null;
+}
+
+function showToast(message, isError = false) {
+  const toast = $("#toast");
+  toast.textContent = message;
+  toast.classList.toggle("error", isError);
+  toast.classList.add("show");
+  clearTimeout(state.toastTimer);
+  state.toastTimer = setTimeout(() => toast.classList.remove("show"), 3600);
+}
+
+function requestText(title, label, { value = "", placeholder = "", maxLength = 200, inputMode = "text" } = {}) {
+  const dialog = $("#inputDialog");
+  const form = $("#inputDialogForm");
+  const input = $("#inputDialogValue");
+  $("#inputDialogTitle").textContent = title;
+  $("#inputDialogLabel").textContent = label;
+  input.value = value;
+  input.placeholder = placeholder;
+  input.maxLength = maxLength;
+  input.inputMode = inputMode;
+
+  return new Promise((resolve) => {
+    const cleanup = () => {
+      dialog.removeEventListener("close", onClose);
+      form.removeEventListener("submit", onSubmit);
+      $("#cancelInputDialog").removeEventListener("click", onCancel);
+      $("#closeInputDialog").removeEventListener("click", onCancel);
+    };
+    const finish = (result) => {
+      cleanup();
+      resolve(result);
+    };
+    const onClose = () => finish(dialog.returnValue === "confirm" ? input.value : null);
+    const onSubmit = (event) => {
+      event.preventDefault();
+      dialog.close("confirm");
+    };
+    const onCancel = () => dialog.close();
+    dialog.addEventListener("close", onClose, { once: true });
+    form.addEventListener("submit", onSubmit);
+    $("#cancelInputDialog").addEventListener("click", onCancel);
+    $("#closeInputDialog").addEventListener("click", onCancel);
+    dialog.showModal();
+    input.focus();
+  });
+}
+
+async function api(path, options = {}) {
+  const method = options.method ?? "GET";
+  const headers = { Accept: "application/json", ...(options.headers ?? {}) };
+  if (options.body !== undefined) headers["Content-Type"] = "application/json";
+  if (!["GET", "HEAD"].includes(method) && !["/api/setup", "/api/auth/login"].includes(path)) {
+    headers["X-CSRF-Token"] = state.csrf;
+  }
+  const response = await fetch(path, {
+    ...options,
+    method,
+    headers,
+    credentials: "same-origin",
+    body: options.body === undefined ? undefined : JSON.stringify(options.body),
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    if (response.status === 401 && state.user) {
+      state.user = null;
+      state.csrf = "";
+      $("#appView").classList.add("hidden");
+      $("#authView").classList.remove("hidden");
+      showToast("Sua sessão expirou. Entre novamente.", true);
+    }
+    throw new Error(result.error ?? `Falha na requisição (${response.status}).`);
+  }
+  return result;
+}
+
+function setAuthMode(setupRequired) {
+  $("#authView").classList.remove("hidden");
+  $("#appView").classList.add("hidden");
+  $("#loginForm").classList.toggle("hidden", setupRequired);
+  $("#setupForm").classList.toggle("hidden", !setupRequired);
+  $("#authTitle").textContent = setupRequired ? "Configure sua loja" : "Bem-vindo de volta";
+  $("#authDescription").textContent = setupRequired
+    ? "Crie o administrador e a primeira unidade para começar."
+    : "Entre para acessar o ponto de venda.";
+}
+
+async function initialize() {
+  try {
+    const status = await api("/api/status");
+    if (status.setupRequired) return setAuthMode(true);
+    const session = await api("/api/me");
+    if (!session.authenticated) return setAuthMode(false);
+    state.csrf = session.csrfToken;
+    await enterApplication(session);
+  } catch (error) {
+    setAuthMode(true);
+    showToast(error.message, true);
+  }
+}
+
+async function enterApplication(session) {
+  state.user = session.user;
+  state.branches = session.branches;
+  if (!state.branches.length) throw new Error("Cadastre uma unidade para continuar.");
+  const saved = Number(localStorage.getItem("pdv_branch"));
+  state.branchId = state.branches.some((branch) => branch.id === saved) ? saved : state.branches[0].id;
+  $("#branchSelect").innerHTML = state.branches.map((branch) =>
+    `<option value="${branch.id}">${escapeHtml(branch.name)}</option>`).join("");
+  $("#branchSelect").value = String(state.branchId);
+  $("#userName").textContent = state.user.name;
+  $("#userRole").textContent = roleLabels[state.user.role];
+  $("#userAvatar").textContent = state.user.name.trim().charAt(0).toUpperCase();
+  $$(".manager-only").forEach((element) => element.classList.toggle("hidden", state.user.role === "CASHIER"));
+  $$(".admin-only").forEach((element) => element.classList.toggle("hidden", state.user.role !== "ADMIN"));
+  $("#authView").classList.add("hidden");
+  $("#appView").classList.remove("hidden");
+  $("#appView").classList.add("sales-active");
+  await loadView("sales");
+}
+
+async function switchView(view) {
+  if (view === "sales") {
+    const cash = await api(`/api/cash?branchId=${state.branchId}`);
+    if (!cash.open) {
+      view = "cash";
+      showToast("Abra o caixa desta unidade antes de acessar as vendas.");
+    }
+  }
+  state.view = view;
+  $("#appView").classList.toggle("sales-active", view === "sales");
+  $$(".nav-link").forEach((button) => button.classList.toggle("active", button.dataset.view === view));
+  $$(".view").forEach((section) => section.classList.toggle("hidden", section.id !== `view-${view}`));
+  loadView(view).catch((error) => showToast(error.message, true));
+}
+
+async function loadView(view) {
+  if (view === "sales") await renderSales();
+  if (view === "products") await renderProducts();
+  if (view === "promotions") await renderPromotions();
+  if (view === "labels") await renderBarcodeLabels();
+  if (view === "customers") await renderCustomers();
+  if (view === "cash") await renderCash();
+  if (view === "reports") await renderReports();
+  if (view === "settings") await renderSettings();
+}
+
+function heading(title, subtitle, actions = "") {
+  return `<div class="page-heading"><div><h1>${title}</h1><p>${subtitle}</p></div><div class="heading-actions">${actions}</div></div>`;
+}
+
+function productImage(product, className = "product-photo") {
+  if (!product.has_image) return `<div class="product-photo-placeholder ${className}" aria-label="Sem imagem">◇</div>`;
+  return `<img class="${className}" src="/api/products/${product.id}/image" alt="${escapeHtml(product.name)}" loading="lazy">`;
+}
+
+function saleTotal() {
+  const subtotal = state.cart.reduce((sum, item) => sum + item.price_cents * item.quantity, 0);
+  const discountInput = $("#discountInput");
+  const discount = discountInput ? parseMoney(discountInput.value) ?? 0 : 0;
+  return { subtotal, discount: Math.min(discount, subtotal), total: Math.max(0, subtotal - discount) };
+}
+
+async function renderSales() {
+  const [products, customers, cash, salesHistory] = await Promise.all([
+    api(`/api/products?branchId=${state.branchId}`),
+    api("/api/customers"),
+    api(`/api/cash?branchId=${state.branchId}`),
+    api(`/api/sales?branchId=${state.branchId}`),
+  ]);
+  state.products = products;
+  state.customers = customers;
+  state.salesHistory = salesHistory;
+  const total = saleTotal();
+  if (!state.paymentRows.length) state.paymentRows = [{ method: "CASH", amountCents: total.total, receivedCents: null, autoAmount: true }];
+  else if (state.paymentRows.length === 1 && state.paymentRows[0].autoAmount) {
+    state.paymentRows[0].amountCents = total.total;
+  }
+  const customersOptions = customers.map((customer) =>
+    `<option value="${customer.id}" ${String(customer.id) === state.customerId ? "selected" : ""}>${escapeHtml(customer.name)}${customer.phone ? ` · ${escapeHtml(customer.phone)}` : ""}</option>`
+  ).join("");
+  const cartItemCount = state.cart.reduce((sum, item) => sum + item.quantity, 0);
+  $("#view-sales").innerHTML = `
+    ${heading("Vendas", `Atendimento rápido · ${escapeHtml(state.branches.find((branch) => branch.id === state.branchId)?.name ?? "")}`,
+      `<button class="button secondary" type="button" id="openSalesHistory">Histórico de vendas</button>`)}
+    <div class="sales-grid">
+      <section class="panel catalog-panel">
+        <div class="panel-head"><div class="catalog-title"><h2>Produtos</h2><span class="muted small">Selecione para adicionar à venda</span></div><span class="badge">${products.length} ${products.length === 1 ? "produto" : "produtos"}</span></div>
+        <input id="productSearch" class="product-search" type="search" placeholder="Buscar produto, SKU ou código de barras (scanner)" aria-label="Buscar por nome, código ou código de barras" autocomplete="off">
+        <div id="productResults" class="product-results">${renderProductTiles(products)}</div>
+        <section class="cart-items-panel" aria-label="Produtos adicionados à venda">
+          <div class="cart-items-heading"><strong>Produtos nesta venda</strong><span>${cartItemCount} ${cartItemCount === 1 ? "item" : "itens"}</span></div>
+          <div class="cart-list">${renderCartRows()}</div>
+        </section>
+      </section>
+      <section class="panel cart-panel">
+        <div class="panel-head"><div class="cart-title"><h2>Venda atual</h2></div><button class="button ghost small-button" type="button" data-action="clear-cart">Limpar</button></div>
+        <div class="panel-body">
+          <div id="saleFocus" class="sale-focus" aria-live="polite">
+            <span class="sale-item-count"><strong id="cartItemCount">0</strong><span>itens na venda</span></span>
+          </div>
+          <div class="cart-totals">
+            <div class="total-line"><span>Subtotal</span><strong>${formatMoney(total.subtotal)}</strong></div>
+            <div class="total-line"><span>Desconto</span><strong id="discountDisplay">${formatMoney(total.discount)}</strong></div>
+            <div class="total-line grand"><span>Total</span><strong id="saleTotal">${formatMoney(total.total)}</strong></div>
+          </div>
+          ${!cash.open ? `<div class="notice">Abra o caixa desta unidade antes de finalizar vendas.</div>` : ""}
+          <div class="cart-fields">
+            <label>Cliente (opcional)
+              <select id="saleCustomer"><option value="">Consumidor não identificado</option>${customersOptions}</select>
+            </label>
+            <label>Desconto em reais
+              <input id="discountInput" inputmode="decimal" type="number" min="0" step="0.01" value="${(total.discount / 100).toFixed(2)}">
+            </label>
+          </div>
+          <div class="payment-heading"><strong>Pagamentos</strong><button class="button secondary small-button" type="button" data-action="add-payment" ${state.paymentRows.length >= 5 ? "disabled" : ""}>Adicionar forma</button></div>
+          <div id="paymentRows">${renderPaymentRows()}</div>
+          <p id="paymentBalance" class="payment-balance"></p>
+          <button id="checkoutButton" class="button primary checkout" type="button" ${state.cart.length && cash.open ? "" : "disabled"}>Finalizar venda</button>
+        </div>
+      </section>
+    </div>
+    `;
+  updateSaleFocus();
+  $("#productSearch")?.focus({ preventScroll: true });
+}
+
+function renderProductTiles(products) {
+  if (!products.length) return `<div class="empty">Nenhum produto encontrado. Cadastre produtos em Produtos e estoque.</div>`;
+  return products.flatMap((product) => (product.variants?.length ? product.variants : [null]).map((variant) => {
+    const stock = variant ? variant.quantity : product.quantity;
+    return `
+    <button class="product-tile ${state.searchMatchProductId === product.id ? "is-search-match" : ""}" type="button" data-action="add-product" data-id="${product.id}" ${variant ? `data-variant-id="${variant.id}"` : ""} aria-pressed="${state.selectedProductId === product.id}" ${stock < 1 ? "disabled" : ""}>
+      ${productImage(product)}
+      <span class="product-tile-copy"><strong>${escapeHtml(product.name)}${variant?.color ? ` · ${escapeHtml(variant.color)}` : ""}${variant?.size ? ` · Tam. ${escapeHtml(variant.size)}` : ""}</strong>
+      ${product.promo_discount_basis_points ? `<span class="product-old-price">${formatMoney(product.regular_price_cents)}</span>` : ""}
+      <span class="product-price">${formatMoney(product.price_cents)}</span>
+      ${product.promo_discount_basis_points ? `<small class="product-promo-badge">${(product.promo_discount_basis_points / 100).toFixed(2)}% OFF</small>` : ""}
+      <small>${stock} em estoque · ${escapeHtml(variant?.sku ?? product.sku)}</small></span>
+    </button>`;
+  })).join("");
+}
+
+function renderCartRows() {
+  if (!state.cart.length) return `<div class="empty">Sua venda está vazia.<br>Selecione um produto para começar.</div>`;
+  return state.cart.map((item) => `
+    <div class="cart-row ${state.selectedProductId === item.id ? "is-selected" : ""}">
+      <strong>${escapeHtml(item.name)}${item.color ? ` · ${escapeHtml(item.color)}` : ""}${item.size ? ` · Tam. ${escapeHtml(item.size)}` : ""}</strong><span class="row-total">${formatMoney(item.price_cents * item.quantity)}</span>
+      <div class="cart-controls">
+        <button class="qty-button" type="button" data-action="qty" data-id="${item.id}" ${item.variantId ? `data-variant-id="${item.variantId}"` : ""} data-change="-1" aria-label="Diminuir">−</button>
+        <span>${item.quantity}</span>
+        <button class="qty-button" type="button" data-action="qty" data-id="${item.id}" ${item.variantId ? `data-variant-id="${item.variantId}"` : ""} data-change="1" aria-label="Aumentar">+</button>
+        <span>x ${formatMoney(item.price_cents)}</span>
+        <button class="remove-button" type="button" data-action="remove-cart" data-id="${item.id}" ${item.variantId ? `data-variant-id="${item.variantId}"` : ""}>Remover</button>
+      </div>
+    </div>`).join("");
+}
+
+function normalizeProductSearch(value) {
+  return String(value ?? "").normalize("NFD").replace(/\p{Diacritic}/gu, "").trim().toLocaleLowerCase("pt-BR");
+}
+
+function productSizeType(...names) {
+  const category = normalizeProductSearch(names.filter(Boolean).join(" "));
+  if (/\b(calcados?|sapatos?|tenis|sandalias?|chinelos?|botas?)\b/.test(category)) return "footwear";
+  if (/\b(calcas?|jeans|leggings?|bermudas?|shorts?)\b/.test(category)) return "trousers";
+  if (/\b(roup\w*|vestuario\w*|vestimenta\w*|vestid\w*|moda\w*|camis\w*|blus\w*|uniforme\w*|lingerie|biquini|jaqueta\w*|moletom|meia|cueca|sutia|saia\w*)\b/.test(category)) return "clothing";
+  return null;
+}
+
+function productSizesForType(type) {
+  if (type === "footwear") return Array.from({ length: 14 }, (_, index) => String(index + 33));
+  if (type === "trousers") return Array.from({ length: 14 }, (_, index) => String(index * 2 + 34));
+  if (type === "clothing") return ["PP", "P", "M", "G", "GG", "XGG"];
+  return [];
+}
+
+function updateProductCategoryFields(variants = null) {
+  const sizeTypeSelect = $("#productSizeTypeSelect");
+  const type = sizeTypeSelect?.value || null;
+  const hasSizes = ["clothing", "trousers", "footwear"].includes(type);
+  const conditionLabel = $("#conditionLabel");
+  const conditionSelect = $("#conditionSelect");
+  const sizeField = $("#productSizeField");
+  const sizeOptions = $("#productSizeOptions");
+  const colorField = $("#productColorField");
+  const quantityLabel = $("#initialQuantityLabel");
+  const form = $("#productForm");
+  const quantityInput = form?.elements.quantity;
+  const subcategorySelect = $("#subcategorySelect");
+  if (subcategorySelect) {
+    subcategorySelect.required = subcategorySelect.options.length > 1;
+    subcategorySelect.closest("label").firstChild.textContent = subcategorySelect.required ? "Subcategoria *" : "Subcategoria";
+  }
+  const editing = Boolean(form?.elements.productId.value);
+  colorField?.classList.toggle("hidden", editing);
+  const currentVariants = variants ?? [...(sizeOptions?.querySelectorAll("[data-size-check]:checked") ?? [])].map((checkbox) => ({
+    size: checkbox.value,
+    quantity: Number(checkbox.closest("[data-size-row]").querySelector("[data-size-qty]").value || 0),
+    price: checkbox.closest("[data-size-row]").querySelector("[data-size-price]")?.value ?? "",
+  }));
+  const selected = new Map(currentVariants.map((variant) => {
+    const cents = variant.price_cents ?? variant.priceCents;
+    const price = variant.price ?? (cents == null ? "" : (Number(cents) / 100).toFixed(2));
+    return [String(variant.size), { quantity: Number(variant.quantity ?? variant.qty ?? 0), price: String(price) }];
+  }));
+  const sizes = productSizesForType(type);
+
+  if (conditionLabel && conditionSelect) {
+    conditionLabel.classList.toggle("hidden", !hasSizes);
+    conditionSelect.required = hasSizes;
+    if (!hasSizes) conditionSelect.value = "";
+    else if (!conditionSelect.value) conditionSelect.value = "novo";
+  }
+  if (sizeField && sizeOptions && quantityInput) {
+    const colorMode = state.productColorRows.length > 0;
+    sizeField.classList.toggle("hidden", !hasSizes || colorMode);
+    quantityLabel.classList.toggle("hidden", hasSizes || colorMode);
+    quantityInput.disabled = hasSizes || colorMode;
+    quantityInput.required = !hasSizes && !colorMode && !editing;
+    sizeField.querySelector(".hint").textContent = editing
+      ? "Tamanhos existentes são mantidos. Use Ajustar ao lado de cada saldo para alterar o estoque."
+      : "Selecione os tamanhos e informe a quantidade disponível em cada um.";
+    sizeOptions.innerHTML = sizes.map((size, index) => {
+      const checked = selected.has(size);
+      return `<label class="product-size-option" data-size-row>
+        <input type="checkbox" data-size-check value="${size}" ${checked ? "checked" : ""} ${editing ? "disabled" : ""}>
+        <span>${size}</span>
+        <input type="number" min="0" max="2147483647" step="1" value="${checked ? selected.get(size).quantity : 0}" data-size-qty aria-label="Estoque tamanho ${size}" ${checked && !editing ? "required" : "disabled"}>
+        <input type="text" inputmode="decimal" maxlength="12" placeholder="Preço (opcional)" value="${checked ? escapeHtml(selected.get(size).price) : ""}" data-size-price aria-label="Preço individual tamanho ${size}" ${checked && !editing ? "" : "disabled"}>
+      </label>`;
+    }).join("");
+    updateProductSizeTotal();
+  }
+  renderProductColorRows(editing);
+}
+
+function renderVariantPriceEditor(variants = []) {
+  const editor = $("#productVariantPriceEditor");
+  const container = $("#productVariantPriceOptions");
+  if (!editor || !container) return;
+
+  editor.classList.toggle("hidden", variants.length === 0);
+
+  container.innerHTML = variants.map((variant) => {
+    const label = [variant.color, variant.size]
+      .filter(Boolean)
+      .join(" · ") || "Sem tamanho";
+
+    const price = variant.price_cents == null
+      ? ""
+      : (Number(variant.price_cents) / 100).toFixed(2);
+
+    return `<label class="product-size-option">
+      <span>${escapeHtml(label)}</span>
+      <input type="text"
+        inputmode="decimal"
+        maxlength="12"
+        placeholder="Preço do produto"
+        value="${escapeHtml(price)}"
+        data-variant-price="${variant.id}"
+        aria-label="Preço individual ${escapeHtml(label)}">
+    </label>`;
+  }).join("");
+}
+
+function updateProductSizeTotal() {
+  const form = $("#productForm");
+  const quantity = form?.elements.quantity;
+  const locked = Boolean(form?.elements.productId.value);
+  const selected = [...(form?.querySelectorAll("[data-size-check]:checked") ?? [])];
+  if (!quantity) return;
+  selected.forEach((checkbox) => {
+    const stock = checkbox.closest("[data-size-row]").querySelector("[data-size-qty]");
+    stock.disabled = !checkbox.checked || locked;
+    stock.required = checkbox.checked && !locked;
+  });
+  const total = selected.reduce((sum, checkbox) =>
+    sum + Number(checkbox.closest("[data-size-row]").querySelector("[data-size-qty]").value || 0), 0);
+  if (quantity.disabled) quantity.value = String(total);
+  updateProductStockTotal(total, quantity.disabled);
+}
+
+function updateProductStockTotal(total, isAutomatic) {
+  const summary = $("#productStockTotal");
+  if (!summary) return;
+  summary.hidden = !isAutomatic;
+  if (isAutomatic) summary.textContent = `Estoque total: ${total} unidade(s).`;
+}
+
+function renderProductColorRows(readOnly = false) {
+  const container = $("#productColorOptions");
+  if (!container) return;
+  const sizes = productSizesForType($("#productSizeTypeSelect")?.value);
+  container.innerHTML = state.productColorRows.map((color, colorIndex) => `
+    <section class="product-color-card" data-product-color-row="${colorIndex}">
+      <div class="product-color-card-heading">
+        <label>Nome da cor *<input type="text" maxlength="50" value="${escapeHtml(color.name)}" data-product-color-name="${colorIndex}" ${readOnly ? "disabled" : "required"}></label>
+        ${readOnly ? "" : `<button class="button secondary small-button" type="button" data-action="remove-product-color" data-index="${colorIndex}">Remover cor</button>`}
+      </div>
+      <label class="product-color-image-label">Imagem desta cor *<input type="file" accept="image/jpeg,image/png,image/webp" data-product-color-image="${colorIndex}" ${readOnly ? "disabled" : color.imageData ? "" : "required"}></label>
+      ${color.imageData ? `<img class="product-color-preview" src="${color.imageData}" alt="Prévia da cor ${escapeHtml(color.name)}">` : ""}
+      ${sizes.length ? `<strong>Tamanhos e estoque desta cor</strong><div class="product-size-options product-color-sizes">
+        ${sizes.map((size) => {
+    const selected = Object.hasOwn(color.quantities, size);
+    return `<label class="product-size-option" data-color-size-row>
+          <input type="checkbox" data-color-size="${colorIndex}:${size}" ${selected ? "checked" : ""} ${readOnly ? "disabled" : ""}>
+          <span>${size}</span>
+          <input type="number" min="0" max="2147483647" step="1" value="${selected ? Number(color.quantities[size]) : 0}" data-color-quantity="${colorIndex}:${size}" aria-label="Estoque ${escapeHtml(color.name || `cor ${colorIndex + 1}`)} tamanho ${size}" ${selected && !readOnly ? "required" : "disabled"}>
+          <input type="text" inputmode="decimal" maxlength="12" placeholder="Preço" value="${selected ? escapeHtml(color.prices[size] ?? "") : ""}" data-color-price="${colorIndex}:${size}" aria-label="Preço individual ${escapeHtml(color.name || `cor ${colorIndex + 1}`)} tamanho ${size}" ${selected && !readOnly ? "" : "disabled"}>
+        </label>`;
+  }).join("")}
+      </div>` : `<label>Estoque desta cor *<input type="number" min="0" max="2147483647" step="1" value="${Number(color.quantity ?? 0)}" data-color-quantity="${colorIndex}:" ${readOnly ? "disabled" : "required"}></label><label>Preço individual (opcional)<input type="text" inputmode="decimal" maxlength="12" placeholder="Preço" value="${escapeHtml(color.price ?? "")}" data-color-price="${colorIndex}:" ${readOnly ? "disabled" : ""}></label>`}
+    </section>`).join("");
+  updateProductColorTotal();
+}
+
+function updateProductColorTotal() {
+  const form = $("#productForm");
+  const quantity = form?.elements.quantity;
+  if (!quantity || !state.productColorRows.length) return;
+  const sizes = productSizesForType($("#productSizeTypeSelect")?.value);
+  const total = state.productColorRows.reduce((sum, color) => {
+    return sum + (sizes.length
+      ? sizes.reduce((colorTotal, size) => colorTotal + Number(color.quantities[size] || 0), 0)
+      : Number(color.quantity || 0));
+  }, 0);
+  quantity.value = String(total);
+  quantity.disabled = true;
+  quantity.required = false;
+  updateProductStockTotal(total, true);
+}
+
+function makeProductColorRow(color = {}) {
+  return {
+    name: String(color.name ?? ""),
+    imageData: color.imageData ?? null,
+    imagePromise: Promise.resolve(),
+    quantities: { ...(color.quantities ?? {}) },
+    prices: { ...(color.prices ?? {}) },
+    quantity: Number(color.quantity ?? 0),
+    price: String(color.price ?? ""),
+  };
+}
+
+function normalizeDisplayName(value) {
+  return String(value ?? "")
+    .normalize("NFC")
+    .trim()
+    .replace(/\s+/gu, " ")
+    .toLocaleLowerCase("pt-BR")
+    .replace(/(^|[\s'’\-])(\p{L})/gu, (_, separator, letter) =>
+      `${separator}${letter.toLocaleUpperCase("pt-BR")}`);
+}
+
+function findExactSearchProduct(query) {
+  const normalized = normalizeProductSearch(query);
+  if (!normalized) return null;
+  const exactCodeMatches = state.products.filter((product) =>
+    [product.sku, product.barcode].some((code) => normalizeProductSearch(code) === normalized));
+  if (exactCodeMatches.length === 1) return exactCodeMatches[0];
+  if (exactCodeMatches.length > 1) return null;
+  const exactNameMatches = state.products.filter((product) =>
+    normalizeProductSearch(product.name) === normalized);
+  return exactNameMatches.length === 1 ? exactNameMatches[0] : null;
+}
+
+function findExactProductCode(query) {
+  const normalized = normalizeProductSearch(query);
+  if (!normalized) return null;
+  const matches = state.products.filter((product) =>
+    [product.sku, product.barcode].some((code) => normalizeProductSearch(code) === normalized));
+  return matches.length === 1 ? matches[0] : null;
+}
+
+function findExactVariantCode(query) {
+  const normalized = normalizeProductSearch(query);
+  if (!normalized) return null;
+  const matches = state.products.flatMap((product) => (product.variants ?? [])
+    .filter((variant) => [variant.sku, variant.barcode].some((code) => normalizeProductSearch(code) === normalized))
+    .map((variant) => ({ product, variant })));
+  return matches.length === 1 ? matches[0] : null;
+}
+
+async function addProductToCart(productId, variantId = null) {
+  const product = state.products.find((item) => item.id === productId);
+  if (!product || product.quantity < 1) return showToast("Produto sem estoque disponível.", true);
+  if (!variantId && product.variants?.length) return showToast("Selecione um tamanho ou use o código de barras da variação.", true);
+  const variant = variantId ? product.variants?.find((entry) => entry.id === variantId) : null;
+  if (variantId && !variant) return showToast("Tamanho do produto não encontrado.", true);
+  const stock = variant ? variant.quantity : product.quantity;
+  const item = state.cart.find((entry) => entry.id === productId && (entry.variantId ?? null) === variantId);
+  if (item && item.quantity >= stock) return showToast("A quantidade supera o estoque disponível para este tamanho.", true);
+  if (item) item.quantity += 1;
+  else state.cart.push({
+    id: product.id,
+    variantId: variant?.id ?? null,
+    sku: variant?.sku ?? product.sku,
+    name: product.name,
+    color: variant?.color ?? null,
+    size: variant?.size ?? null,
+    price_cents: product.price_cents,
+    quantity: 1,
+  });
+  state.selectedProductId = product.id;
+  state.searchMatchProductId = null;
+  await renderSales();
+}
+
+function updateSaleFocus() {
+  const focus = $("#saleFocus");
+  if (!focus) return;
+  const itemCount = state.cart.reduce((sum, item) => sum + item.quantity, 0);
+  const itemCountLabel = itemCount === 1 ? "item na venda" : "itens na venda";
+  const selectedProduct = state.products.find((product) =>
+    product.id === (state.searchMatchProductId ?? state.selectedProductId));
+  if (!selectedProduct) {
+    focus.innerHTML = `<span class="sale-item-count"><strong id="cartItemCount">${itemCount}</strong><span>${itemCountLabel}</span></span>
+      <span class="sale-focus-empty">Selecione um produto ou digite/escaneie o código para destacar o item, o valor e o pagamento.</span>
+      <div class="sale-focus-total"><small>Total da venda</small><strong>${formatMoney(saleTotal().total)}</strong>
+      <span class="sale-focus-payment">Pagamento: <strong>${state.paymentRows.map((payment) => paymentLabels[payment.method]).join(" + ") || "—"}</strong></span></div>`;
+    return;
+  }
+  const cartItem = state.cart.find((item) => item.id === selectedProduct.id);
+  const quantity = cartItem?.quantity ?? 1;
+  const itemTotal = cartItem ? cartItem.price_cents * quantity : selectedProduct.price_cents;
+  focus.innerHTML = `<span class="sale-item-count"><strong id="cartItemCount">${itemCount}</strong><span>${itemCountLabel}</span></span>
+    ${productImage(selectedProduct, "sale-focus-image")}
+    <div class="sale-focus-product"><small>${cartItem ? "Produto na venda" : "Produto selecionado"}</small>
+      <strong>${escapeHtml(selectedProduct.name)}</strong>
+      <span>${quantity} × ${formatMoney(selectedProduct.price_cents)}${cartItem ? ` · Item: ${formatMoney(itemTotal)}` : " · pronto para adicionar"}</span>
+    </div>
+    <div class="sale-focus-total"><small>Total da venda</small><strong>${formatMoney(saleTotal().total)}</strong>
+      <span class="sale-focus-payment">Pagamento: <strong>${state.paymentRows.map((payment) => paymentLabels[payment.method]).join(" + ") || "—"}</strong></span></div>`;
+}
+
+function renderSalesTable(sales) {
+  if (!sales.length) return `<div class="empty">Ainda não há vendas neste período.</div>`;
+  return `<div class="table-wrap"><table><thead><tr><th>Venda</th><th>Data</th><th>Operador</th><th>Total</th><th>Status</th><th>Ações</th></tr></thead><tbody>
+    ${sales.map((sale) => `<tr>
+      <td><strong>#${sale.id}</strong></td><td>${escapeHtml(new Date(`${sale.created_at.replace(" ", "T")}Z`).toLocaleString("pt-BR"))}</td>
+      <td>${escapeHtml(sale.cashier)}</td><td>${formatMoney(sale.total_cents)}</td>
+      <td><span class="badge ${sale.status === "CANCELED" ? "canceled" : ""}">${sale.status === "CANCELED" ? "Cancelada" : "Concluída"}</span></td>
+      <td><div class="table-actions"><button class="button secondary" type="button" data-action="receipt" data-id="${sale.id}">Comprovante</button>
+      ${state.user.role !== "CASHIER" && sale.status === "COMPLETED" ? `<button class="button danger" type="button" data-action="cancel-sale" data-id="${sale.id}">Cancelar</button>` : ""}</div></td>
+    </tr>`).join("")}
+    </tbody></table></div>`;
+}
+
+async function openSalesHistory() {
+  state.salesHistory = await api(`/api/sales?branchId=${state.branchId}`);
+  $("#salesHistoryBody").innerHTML = renderSalesTable(state.salesHistory);
+  $("#salesHistoryNotice").textContent = state.user.role === "CASHIER"
+    ? "Operadores podem consultar comprovantes. O cancelamento e os estornos são restritos a gerentes e administradores."
+    : "Cancelamentos restauram o estoque e ajustam o faturamento. Estornos de Pix/cartão precisam ser confirmados na operadora.";
+  $("#salesHistoryDialog").showModal();
+}
+
+function updateSaleTotals() {
+  const total = saleTotal();
+  const subtotalElement = $(".cart-totals .total-line strong");
+  if (subtotalElement) subtotalElement.textContent = formatMoney(total.subtotal);
+  if ($("#discountDisplay")) $("#discountDisplay").textContent = formatMoney(total.discount);
+  if ($("#saleTotal")) $("#saleTotal").textContent = formatMoney(total.total);
+  if (state.paymentRows.length === 1 && state.paymentRows[0].autoAmount) {
+    state.paymentRows[0].amountCents = total.total;
+    const amountInput = $("[data-payment-amount='0']");
+    if (amountInput) amountInput.value = (total.total / 100).toFixed(2);
+  }
+  updatePaymentBalance();
+  updateSaleFocus();
+}
+
+function syncPaymentRows() {
+  const keepAutoAmount = state.paymentRows.length === 1 && state.paymentRows[0].autoAmount;
+  state.paymentRows = $$("#paymentRows .payment-row").map((row, index) => {
+    const method = $(`[data-payment-method="${index}"]`, row).value;
+    const amountCents = parseMoney($(`[data-payment-amount="${index}"]`, row).value);
+    const received = $(`[data-payment-received="${index}"]`, row);
+    return {
+      method,
+      amountCents: amountCents ?? 0,
+      receivedCents: received?.value ? parseMoney(received.value) : null,
+      autoAmount: keepAutoAmount,
+    };
+  });
+}
+
+function updatePaymentBalance() {
+  const balanceElement = $("#paymentBalance");
+  if (!balanceElement) return;
+  const total = saleTotal().total;
+  const paid = $$("#paymentRows [data-payment-amount]").reduce((sum, input) => sum + (parseMoney(input.value) ?? 0), 0);
+  const balance = total - paid;
+  balanceElement.textContent = balance > 0
+    ? `Falta pagar ${formatMoney(balance)}`
+    : balance < 0 ? `Pagamento excede o total em ${formatMoney(Math.abs(balance))}` : "Pagamento completo";
+  balanceElement.classList.toggle("invalid", balance !== 0);
+  balanceElement.classList.toggle("valid", balance === 0);
+}
+
+function renderProductImagePreview(source) {
+  const image = $("#productImagePreview");
+  const placeholder = $("#productImagePlaceholder");
+  image.src = source;
+  image.classList.remove("hidden");
+  placeholder.classList.add("hidden");
+}
+
+function clearProductImagePreview() {
+  $("#productImagePreview").removeAttribute("src");
+  $("#productImagePreview").classList.add("hidden");
+  $("#productImagePlaceholder").classList.remove("hidden");
+}
+
+async function optimizeProductImage(file) {
+  if (!file.type.startsWith("image/")) throw new Error("Escolha um arquivo de imagem.");
+  if (file.size > 12 * 1024 * 1024) throw new Error("A imagem original deve ter até 12 MB.");
+  if (typeof createImageBitmap !== "function") throw new Error("Este navegador não oferece suporte ao processamento de imagens.");
+  const bitmap = await createImageBitmap(file);
+  try {
+    const maxDimension = 640;
+    const scale = Math.min(1, maxDimension / Math.max(bitmap.width, bitmap.height));
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+    canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+    const context = canvas.getContext("2d");
+    if (!context) throw new Error("Não foi possível preparar a imagem.");
+    context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    const imageData = await new Promise((resolve, reject) => {
+      canvas.toBlob((blob) => {
+        if (!blob) return reject(new Error("Não foi possível converter a imagem."));
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(new Error("Não foi possível ler a imagem processada."));
+        reader.readAsDataURL(blob);
+      }, "image/jpeg", 0.78);
+    });
+    if (imageData.length > 1024 * 1024) throw new Error("A imagem otimizada ficou muito grande. Escolha uma imagem menor.");
+    return imageData;
+  } finally {
+    bitmap.close();
+  }
+}
+
+async function renderProducts() {
+  state.productImageData = undefined;
+  state.productImagesData = [];
+  state.productImagesPromise = Promise.resolve([]);
+  state.productImageDirty = false;
+  state.productColorRows = [];
+  const products = await api(`/api/products?branchId=${state.branchId}`);
+  state.products = products;
+
+  // Carregar marcas e categorias
+  const brands = await api("/api/brands");
+  const categories = await api("/api/categories");
+  state.brands = brands;
+  state.categories = categories;
+
+  const canEdit = state.user.role !== "CASHIER";
+  let syncEnabled = false;
+  let siteCandidates = [];
+  let reconciliationError = "";
+  if (canEdit) {
+    try {
+      syncEnabled = (await api("/api/site-sync/status")).enabled;
+      if (syncEnabled) {
+        const result = await api("/api/site-sync/products/unlinked");
+        siteCandidates = Array.isArray(result) ? result : result.products ?? result.data ?? [];
+        if (!Array.isArray(siteCandidates)) throw new Error("O site retornou uma lista inválida.");
+        siteCandidates = siteCandidates.filter((candidate) => candidate.linked !== true);
+      }
+    } catch (error) {
+      reconciliationError = error.message;
+    }
+  }
+  const reconciliation = syncEnabled ? `
+    <section class="panel section-spacer">
+      <div class="panel-head"><div><h2>Vincular produtos existentes no site</h2>
+        <p class="hint">Compare os nomes e selecione manualmente o produto correspondente. Os códigos no site só serão alterados após confirmar o vínculo.</p></div>
+        <button class="button secondary" type="button" data-action="refresh-site-products">Atualizar candidatos</button>
+      </div>
+      ${reconciliationError ? `<p class="sync-error">Não foi possível carregar os produtos sem vínculo: ${escapeHtml(reconciliationError)}</p>` :
+        siteCandidates.length ? `<div class="table-wrap"><table><thead><tr><th>Produto no PDV</th><th>Produto candidato no site</th><th>Ação</th></tr></thead><tbody>
+          ${products.filter((product) => product.sku && product.barcode).map((product) => {
+    const localName = normalizeProductSearch(product.name);
+    const candidates = [...siteCandidates].sort((a, b) => {
+      const score = (candidate) => {
+        const name = normalizeProductSearch(candidate.name);
+        return name === localName ? 0 : name.includes(localName) || localName.includes(name) ? 1 : 2;
+      };
+      return score(a) - score(b) || String(a.name).localeCompare(String(b.name), "pt-BR");
+    });
+    return `<tr><td><strong>${escapeHtml(product.name)}</strong><small class="table-subtext">SKU ${escapeHtml(product.sku)} · ${escapeHtml(product.barcode)}</small></td>
+      <td><select aria-label="Produto do site correspondente a ${escapeHtml(product.name)}" data-site-candidate="${product.id}">
+        <option value="">Selecione pelo nome</option>
+        ${candidates.map((candidate) => `<option value="${Number(candidate.id ?? candidate.productId)}">${escapeHtml(candidate.name)} · #${Number(candidate.id ?? candidate.productId)}${candidate.sku ? ` · SKU ${escapeHtml(candidate.sku)}` : ""}</option>`).join("")}
+      </select></td><td><button class="button secondary" type="button" data-action="link-site-product" data-id="${product.id}" disabled>Confirmar vínculo</button></td></tr>`;
+  }).join("")}
+        </tbody></table></div>` : `<div class="empty">Não há produtos candidatos sem vínculo no site.</div>`}
+    </section>` : "";
+  $("#view-products").innerHTML = `
+    ${heading("Produtos e estoque", "Cadastre produtos e acompanhe o saldo desta unidade.")}
+    ${canEdit ? `<form id="productForm" class="panel form-section">
+      <h2 id="productFormTitle">Novo produto</h2>
+      <input type="hidden" name="productId">
+      <div class="form-grid">
+        <label>Nome do produto *<input name="name" required maxlength="160"></label>
+        <label>Marca *<select name="brandId" id="brandSelect" required>
+          <option value="">Selecione uma marca</option>
+          ${state.brands.map(brand => `<option value="${brand.id}">${escapeHtml(brand.name)}</option>`).join("")}
+        </select><button type="button" class="button secondary small-button" id="addBrandBtn">+</button></label>
+        <label>Tipo de peça *<select name="sizeType" id="productSizeTypeSelect" required>
+          <option value="">Selecione o tipo de peça</option>
+          <option value="clothing">Roupas em letras (PP a XGG: blusas, camisetas, vestidos, saias e jaquetas)</option>
+          <option value="trousers">Calça, legging, bermuda e shorts (numeração 34 a 60)</option>
+          <option value="footwear">Calçado (numeração 33 a 46)</option>
+          <option value="none">Outro produto, sem grade de tamanho</option>
+        </select></label>
+        <label>Categoria *<select name="categoryId" id="categorySelect" required>
+          <option value="">Selecione uma categoria</option>
+          ${state.categories.filter(cat => !cat.parent_id).map(cat => `<option value="${cat.id}" data-name="${escapeHtml(cat.name)}">${escapeHtml(cat.name)}</option>`).join("")}
+        </select><button type="button" class="button secondary small-button" id="addCategoryBtn">+</button></label>
+        <label>Subcategoria<select name="subcategoryId" id="subcategorySelect" disabled>
+          <option value="">Selecione uma subcategoria</option>
+        </select><button type="button" class="button secondary small-button" id="addSubcategoryBtn" title="Selecione uma categoria antes de cadastrar uma subcategoria">+</button></label>
+        <label class="wide">Descrição do produto *
+          <textarea name="description" id="productDescription" rows="4" maxlength="1000" placeholder="Descreva as características do produto (até 1.000 caracteres)." required></textarea>
+          <span id="productDescriptionCount" class="hint">0/1000 caracteres</span>
+        </label>
+        <label>Preço de venda (R$) *<input name="price" type="number" min="0" step="0.01" required></label>
+        <label>Custo (R$) *<input name="cost" type="number" min="0" step="0.01" required></label>
+        <label id="conditionLabel" class="hidden">Estado do produto *<select name="condition" id="conditionSelect">
+          <option value="">Selecione o estado</option>
+          <option value="novo">Novo</option>
+          <option value="seminovo">Seminovo</option>
+          <option value="brecho">Brechó</option>
+        </select></label>
+        <label>Estoque mínimo *<input name="minStock" type="number" min="0" step="1" required></label>
+        <label id="initialQuantityLabel">Estoque inicial nesta unidade *<input name="quantity" type="number" min="0" step="1" required></label>
+        <div id="productSizeField" class="wide hidden">
+          <strong>Tamanhos e estoque por tamanho *</strong>
+          <p class="hint">Selecione os tamanhos e informe a quantidade disponível em cada um.</p>
+          <div id="productSizeOptions" class="product-size-options"></div>
+        </div>
+        <div id="productColorField" class="wide product-color-field">
+          <div class="product-color-heading"><div><strong>Cores do produto</strong><p class="hint">Adicione uma foto para cada cor; o estoque será individual por cor e tamanho.</p></div>
+            <button class="button secondary small-button" type="button" data-action="add-product-color">Adicionar cor</button></div>
+          <div id="productColorOptions" class="product-color-options"></div>
+        </div>
+
+        <div id="productVariantPriceEditor" class="wide hidden">
+          <strong>Preços individuais das variações</strong>
+          <p class="hint">Informe um preço para cada variação ou deixe vazio para usar o preço do produto.</p>
+          <div id="productVariantPriceOptions" class="product-size-options"></div>
+        </div>
+        <p id="productStockTotal" class="hint wide hidden" role="status" aria-live="polite"></p>
+        <label class="wide image-file-label">Imagens do produto (até 10) *
+          <input id="productImageInput" name="images" type="file" accept="image/jpeg,image/png,image/webp" multiple required>
+          <span class="hint">A primeira imagem será usada no PDV; todas serão enviadas ao catálogo do site.</span>
+        </label>
+        <div class="product-image-editor wide">
+          <div class="product-image-editor-preview">
+            <img id="productImagePreview" class="hidden" alt="Prévia da imagem do produto">
+            <span id="productImagePlaceholder">Prévia da imagem</span>
+          </div>
+          <label id="removeProductImageLabel" class="image-remove hidden"><input id="removeProductImage" type="checkbox"> Remover imagem atual</label>
+          <p id="productImageSelectionHint" class="hint">Nenhuma imagem selecionada.</p>
+        </div>
+      </div>
+      <div class="form-actions"><button class="button primary" type="submit">Revisar e salvar produto</button><button id="cancelProductEdit" class="button secondary hidden" type="button">Cancelar edição</button></div>
+    </form>` : ""}
+    <section class="panel">
+      <div class="panel-head"><h2>Estoque da unidade</h2><input id="inventorySearch" class="search-field" type="search" placeholder="Buscar produto"></div>
+      ${products.length ? `<div class="table-wrap"><table><thead><tr><th>Produto</th><th>SKU / Código de barras</th><th>Marca / Categoria</th><th>Preço</th><th>Saldo</th><th>Mínimo</th>${canEdit ? "<th>Ações</th>" : ""}</tr></thead><tbody>
+      ${products.map((product) => `<tr data-search="${escapeHtml([product.name, product.sku, product.barcode, product.brand_name, product.category_name].join(" "))}"><td><div class="product-table-name">${productImage(product, "product-table-photo")}<strong>${escapeHtml(product.name)}</strong></div></td><td><span class="code-stack"><span>${escapeHtml(product.sku)}</span><span>${escapeHtml(product.barcode)}</span></span></td>
+        <td><small>${escapeHtml(product.brand_name || "—")}</small><br><small class="muted">${escapeHtml(product.category_name || "—")}</small></td><td>${formatMoney(product.price_cents)}</td>
+        <td>${product.variants?.length ? `<div class="size-stock-list">${product.variants.map((variant) => `<span><strong>${variant.color ? `${escapeHtml(variant.color)} · ` : ""}${escapeHtml(variant.size || "sem tamanho")}</strong>: ${variant.quantity}
+          <small>SKU ${escapeHtml(variant.sku)} · EAN ${escapeHtml(variant.barcode)}</small>
+          ${canEdit ? `<button class="button secondary small-button" type="button" data-action="adjust-size-stock" data-id="${product.id}" data-variant-id="${variant.id}">Ajustar</button>
+          <button class="button secondary small-button" type="button" data-action="transfer-size-stock" data-id="${product.id}" data-variant-id="${variant.id}" ${state.branches.some((branch) => branch.id !== state.branchId) ? "" : "disabled"}>Transferir</button>` : ""}</span>`).join("")}</div>` : `<span class="badge ${product.quantity <= product.min_stock ? "canceled" : ""}">${product.quantity}</span>`}</td>
+        <td>${product.min_stock}</td>${canEdit ? `<td><div class="table-actions">
+          <button class="button secondary" type="button" data-action="edit-product" data-id="${product.id}">Editar</button>
+          ${product.variants?.length ? "" : `<button class="button secondary" type="button" data-action="adjust-stock" data-id="${product.id}">Ajustar</button>`}
+          <button class="button secondary" type="button" data-action="transfer-stock" data-id="${product.id}" ${state.branches.some((branch) => branch.id !== state.branchId) && !product.variants?.length ? "" : "disabled"}>Transferir</button>
+        </div></td>` : ""}</tr>`).join("")}
+      </tbody></table></div>` : `<div class="empty">Nenhum produto cadastrado.</div>`}
+    </section>
+    ${reconciliation}`;
+      updateProductCategoryFields();
+}
+
+async function renderPromotions() {
+    const [products, promotions, sync] = await Promise.all([
+      api(`/api/products?branchId=${state.branchId}`),
+      api("/api/promotions"),
+      api("/api/site-sync/status"),
+    ]);
+    const dateLabel = (value) => new Date(value).toLocaleString("pt-BR");
+    const statusLabels = { ACTIVE: "Ativa", SCHEDULED: "Agendada", ENDED: "Encerrada" };
+    $("#view-promotions").innerHTML = `
+      ${heading("Promoções", "Agende descontos percentuais. O preço promocional será aplicado no PDV e enviado ao site.")}
+      <section class="panel form-section">
+        <form id="promotionForm" class="stack">
+          <h2>Nova promoção</h2>
+          <div class="form-grid">
+            <label>Produto<select name="productId" required>
+              <option value="">Selecione um produto</option>
+              ${products.map((product) => `<option value="${product.id}">${escapeHtml(product.name)} · ${formatMoney(product.regular_price_cents)} · SKU ${escapeHtml(product.sku)}</option>`).join("")}
+            </select></label>
+            <label>Desconto (%)<input name="discountPercent" type="number" min="0.01" max="99.99" step="0.01" required></label>
+            <label>Início<input name="startsAt" type="datetime-local" required></label>
+            <label>Término<input name="endsAt" type="datetime-local" required></label>
+          </div>
+          <p class="hint">Antes de iniciar, confira se o SKU deste produto é igual ao SKU cadastrado no site. Sem correspondência, o evento ficará pendente para correção.</p>
+          <div class="form-actions"><button class="button primary" type="submit">Agendar promoção</button></div>
+        </form>
+      </section>
+      <section class="panel promotion-list">
+        <div class="panel-head"><h2>Promoções cadastradas</h2></div>
+        ${promotions.length ? `<div class="table-wrap"><table><thead><tr><th>Produto</th><th>Desconto</th><th>Período</th><th>Status</th><th>Ações</th></tr></thead><tbody>
+        ${promotions.map((promotion) => `<tr><td><strong>${escapeHtml(promotion.product_name)}</strong><small class="table-subtext">SKU ${escapeHtml(promotion.sku)}</small></td>
+          <td>${(promotion.discount_basis_points / 100).toFixed(2)}%</td>
+          <td>${dateLabel(promotion.starts_at)} – ${dateLabel(promotion.ends_at)}</td>
+          <td><span class="badge ${promotion.status === "ACTIVE" ? "success" : ""}">${statusLabels[promotion.status]}</span></td>
+          <td><button class="button secondary" type="button" data-action="cancel-promotion" data-id="${promotion.id}">Encerrar</button></td></tr>`).join("")}
+        </tbody></table></div>` : `<div class="empty">Nenhuma promoção cadastrada.</div>`}
+      </section>
+      <section class="panel sync-status">
+        <div class="panel-head"><h2>Sincronização com o site</h2>
+          <div class="heading-actions">
+            ${sync.enabled && state.user.role === "ADMIN" ? `<button class="button secondary" type="button" data-action="reconcile-site-stock">Alinhar estoque e preços iniciais</button>` : ""}
+            ${sync.enabled && sync.pending ? `<button class="button secondary" type="button" data-action="retry-site-sync">Tentar novamente</button>` : ""}
+          </div>
+        </div>
+        <div class="panel-body">
+          ${!sync.enabled ? `<p>A integração ainda não está configurada no servidor.</p>` :
+            sync.pending ? `<p>${sync.pending} atualização(ões) aguardando envio para ${escapeHtml(sync.branchName)}.</p>
+              ${sync.failed ? `<p>${sync.failed} atualização(ões) com erro aguardam correção ou nova tentativa.</p>` : ""}
+              ${sync.lastError ? `<p class="sync-error">Último erro: ${escapeHtml(sync.lastError)}</p>` : ""}` :
+              `<p>Sem atualizações pendentes. As movimentações da unidade ${escapeHtml(sync.branchName)} serão enviadas automaticamente.</p>`}
+          ${sync.enabled && state.user.role === "ADMIN" ? `<p class="hint">O alinhamento inicial substitui no site os saldos e preços pelos valores atuais do PDV. Faça isso uma vez, depois de conferir os SKUs e as quantidades.</p>` : ""}
+        </div>
+      </section>`;
+}
+
+const CODE128_PATTERNS = [
+  "212222", "222122", "222221", "121223", "121322", "131222", "122213", "122312", "132212", "221213",
+  "221312", "231212", "112232", "122132", "122231", "113222", "123122", "123221", "223211", "221132",
+  "221231", "213212", "223112", "312131", "311222", "321122", "321221", "312212", "322112", "322211",
+  "212123", "212321", "232121", "111323", "131123", "131321", "112313", "132113", "132311", "211313",
+  "231113", "231311", "112133", "112331", "132131", "113123", "113321", "133121", "313121", "211331",
+  "231131", "213113", "213311", "213131", "311123", "311321", "331121", "312113", "312311", "332111",
+  "314111", "221411", "431111", "111224", "111422", "121124", "121421", "141122", "141221", "112214",
+  "112412", "122114", "122411", "142112", "142211", "241211", "221114", "413111", "241112", "134111",
+  "111242", "121142", "121241", "114212", "124112", "124211", "411212", "421112", "421211", "212141",
+  "214121", "412121", "111143", "111341", "131141", "114113", "114311", "411113", "411311", "113141",
+  "114131", "311141", "411131",
+];
+const CODE128_START_C = "211232";
+const CODE128_CODE_B = "114131";
+const CODE128_STOP = "2331112";
+const CODE128_QUIET_ZONE_MODULES = 10;
+
+function code128Barcode(value) {
+  const barcode = String(value ?? "");
+  if (!/^\d{13}$/.test(barcode)) return null;
+  const digits = [...barcode].map(Number);
+  const checkDigit = digits.slice(0, 12).reduce((sum, digit, index) =>
+    sum + digit * (index % 2 === 0 ? 1 : 3), 0);
+  if ((10 - (checkDigit % 10)) % 10 !== digits[12]) return null;
+
+  const codewords = [105];
+  for (let index = 0; index < 12; index += 2) {
+    codewords.push(Number(barcode.slice(index, index + 2)));
+  }
+  codewords.push(100, Number(barcode[12]) + 16);
+  const checkCodeword = codewords.reduce((sum, codeword, index) =>
+    sum + codeword * (index || 1), 0) % 103;
+  const encoded = [CODE128_START_C];
+  for (const codeword of codewords.slice(1, 7)) encoded.push(CODE128_PATTERNS[codeword]);
+  encoded.push(CODE128_CODE_B, CODE128_PATTERNS[Number(barcode[12]) + 16], CODE128_PATTERNS[checkCodeword], CODE128_STOP);
+  const runs = encoded.flatMap((pattern) => [...pattern].map(Number));
+  const modules = encoded.reduce((sum, pattern) =>
+    sum + [...pattern].reduce((patternSum, width) => patternSum + Number(width), 0), 0);
+  return { runs, moduleCount: modules + CODE128_QUIET_ZONE_MODULES * 2 };
+}
+
+function barcodeSvg(value) {
+  const barcode = String(value ?? "");
+  const pattern = code128Barcode(barcode);
+  if (!pattern) return "";
+  let moduleX = CODE128_QUIET_ZONE_MODULES;
+  let isBar = true;
+  const bars = pattern.runs.flatMap((run) => {
+    const x = moduleX;
+    moduleX += run;
+    const bar = isBar ? [`<rect x="${x}" y="2" width="${run}" height="48"/>`] : [];
+    isBar = !isBar;
+    return bar;
+  }).join("");
+  return `<svg class="barcode-symbol" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${pattern.moduleCount} 58" preserveAspectRatio="none" role="img" aria-label="Código Code 128 ${barcode}" shape-rendering="crispEdges">
+    <g fill="#111">${bars}</g><text x="${pattern.moduleCount / 2}" y="56" text-anchor="middle" fill="#111" font-family="Arial,sans-serif" font-size="8">${barcode}</text>
+  </svg>`;
+}
+
+function pdfBarcodeBytes(labels, dimensions, showName, showPrice) {
+  const pageWidthMm = 210;
+  const pageHeightMm = 297;
+  const marginMm = 3.5;
+  const gapMm = 1;
+  const pointsPerMm = 72 / 25.4;
+  const columns = Math.max(1, Math.floor((pageWidthMm - 2 * marginMm + gapMm) / (dimensions.width + gapMm)));
+  const rowsPerPage = Math.min(
+    Math.max(1, Math.floor((pageHeightMm - 2 * marginMm + gapMm) / (dimensions.height + gapMm))),
+    Math.floor(MAX_LABEL_COPIES / columns),
+  );
+  const labelsPerPage = columns * rowsPerPage;
+  const pageCount = Math.ceil(labels.length / labelsPerPage);
+  const pageWidth = pageWidthMm * pointsPerMm;
+  const pageHeight = pageHeightMm * pointsPerMm;
+  const textCanvas = document.createElement("canvas");
+  const textContext = textCanvas.getContext("2d");
+  const encodeText = (value) => {
+    const specialCharacters = {
+      "€": 0x80, "‚": 0x82, "ƒ": 0x83, "„": 0x84, "…": 0x85, "†": 0x86, "‡": 0x87,
+      "ˆ": 0x88, "‰": 0x89, "Š": 0x8a, "‹": 0x8b, "Œ": 0x8c, "Ž": 0x8e, "‘": 0x91,
+      "’": 0x92, "“": 0x93, "”": 0x94, "•": 0x95, "–": 0x96, "—": 0x97, "˜": 0x98,
+      "™": 0x99, "š": 0x9a, "›": 0x9b, "œ": 0x9c, "ž": 0x9e, "Ÿ": 0x9f,
+    };
+    return [...String(value)].map((character) => {
+      const codePoint = character.codePointAt(0);
+      if (specialCharacters[character]) return specialCharacters[character];
+      return codePoint >= 32 && codePoint <= 255 ? codePoint : 63;
+    });
+  };
+  const pdfString = (value) => encodeText(value).map((byte) => {
+    const character = String.fromCharCode(byte);
+    return ["\\", "(", ")"].includes(character) ? `\\${character}` : character;
+  }).join("");
+  const textWidth = (value, size, bold) => {
+    if (!textContext) return [...String(value)].length * size * 0.55;
+    textContext.font = `${bold ? "bold " : ""}${size}pt Arial`;
+    return textContext.measureText(value).width * 0.75;
+  };
+  const drawText = (parts, value, centerX, baselineY, size, bold, maxWidth) => {
+    if (!value) return;
+    const width = textWidth(value, size, bold);
+    const scale = width > maxWidth ? maxWidth / width * 100 : 100;
+    parts.push(`BT /F${bold ? 2 : 1} ${size.toFixed(2)} Tf ${scale.toFixed(2)} Tz ${(centerX - Math.min(width, maxWidth) / 2).toFixed(2)} ${baselineY.toFixed(2)} Td (${pdfString(value)}) Tj ET`);
+  };
+  const partsByPage = Array.from({ length: pageCount }, () => []);
+  labels.forEach((product, index) => {
+    const pageIndex = Math.floor(index / labelsPerPage);
+    const positionOnPage = index % labelsPerPage;
+    const row = Math.floor(positionOnPage / columns);
+    const column = positionOnPage % columns;
+    const labelsOnPage = Math.min(labelsPerPage, labels.length - pageIndex * labelsPerPage);
+    const rowsOnPage = Math.ceil(labelsOnPage / columns);
+    const labelsInRow = Math.min(columns, labelsOnPage - row * columns);
+    const rowWidthMm = labelsInRow * dimensions.width + (labelsInRow - 1) * gapMm;
+    const gridHeightMm = rowsOnPage * dimensions.height + (rowsOnPage - 1) * gapMm;
+    const x = ((pageWidthMm - rowWidthMm) / 2 + column * (dimensions.width + gapMm)) * pointsPerMm;
+    const top = ((pageHeightMm - gridHeightMm) / 2 + row * (dimensions.height + gapMm)) * pointsPerMm;
+    const width = dimensions.width * pointsPerMm;
+    const height = dimensions.height * pointsPerMm;
+    const pad = 1.1 * pointsPerMm;
+    const innerWidth = width - 2 * pad;
+    const innerHeight = height - 2 * pad;
+    const symbolWidth = width - 2 * pad;
+    const symbolX = x + (width - symbolWidth) / 2;
+    const barcode = code128Barcode(product.barcode);
+    const parts = partsByPage[pageIndex];
+
+    const nameFontSize = 6;
+    const priceFontSize = 6.5;
+    const barcodeNumberSize = 5.5;
+    const nameSlot = showName ? 7.5 : 0;
+    const numberSlot = 7;
+    const priceSlot = showPrice ? 8 : 0;
+    const gapCount = Number(showName) + 1 + Number(showPrice);
+    const contentGap = 2;
+    const remainingHeight = Math.max(0, innerHeight - nameSlot - numberSlot - priceSlot - gapCount * contentGap);
+    const barHeight = Math.min(innerHeight * 0.55, remainingHeight);
+    const contentHeight = nameSlot + barHeight + numberSlot + priceSlot + gapCount * contentGap;
+    let cursorTop = top + (height - contentHeight) / 2;
+
+    parts.push(`0.78 G 0.3 w [1.2 1.2] 0 d ${(x + 0.5).toFixed(2)} ${(pageHeight - top - height + 0.5).toFixed(2)} ${(width - 1).toFixed(2)} ${(height - 1).toFixed(2)} re S [] 0 d 0 G`);
+
+    if (showName) {
+      drawText(parts, product.name, x + width / 2, pageHeight - cursorTop - nameFontSize * 0.85, nameFontSize, true, innerWidth);
+      cursorTop += nameSlot + contentGap;
+    }
+
+    const unitX = symbolWidth / barcode.moduleCount;
+    const barcodeTop = cursorTop;
+    let moduleX = CODE128_QUIET_ZONE_MODULES;
+    let isBar = true;
+    const barBottom = pageHeight - barcodeTop - barHeight;
+    const barRects = barcode.runs.flatMap((run) => {
+      const currentX = moduleX;
+      moduleX += run;
+      const rect = isBar ? [`${currentX} ${barBottom.toFixed(2)} ${run} ${barHeight.toFixed(2)} re`] : [];
+      isBar = !isBar;
+      return rect;
+    });
+    parts.push(`0 0 0 rg q ${unitX.toFixed(6)} 0 0 1 ${symbolX.toFixed(2)} 0 cm ${barRects.join(" ")} f Q`);
+    cursorTop += barHeight + contentGap;
+    drawText(parts, product.barcode, x + width / 2, pageHeight - cursorTop - numberSlot * 0.72, barcodeNumberSize, false, innerWidth);
+    cursorTop += numberSlot;
+
+    if (showPrice) {
+      cursorTop += contentGap;
+      drawText(parts, formatMoney(product.price_cents), x + width / 2, pageHeight - cursorTop - priceFontSize * 0.85, priceFontSize, true, innerWidth);
+    }
+  });
+
+  const objects = [
+    "<< /Type /Catalog /Pages 2 0 R >>",
+    `<< /Type /Pages /Kids [${Array.from({ length: pageCount }, (_, index) => `${5 + index * 2} 0 R`).join(" ")}] /Count ${pageCount} >>`,
+    "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+    "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>",
+  ];
+  partsByPage.forEach((parts, index) => {
+    const pageObjectId = 5 + index * 2;
+    const streamObjectId = pageObjectId + 1;
+    const stream = parts.join("\n");
+    objects.push(`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${(pageWidth).toFixed(2)} ${(pageHeight).toFixed(2)}] /Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> /Contents ${streamObjectId} 0 R >>`);
+    objects.push(`<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`);
+  });
+
+  let documentText = "%PDF-1.4\n";
+  const offsets = [0];
+  objects.forEach((object, index) => {
+    offsets.push(documentText.length);
+    documentText += `${index + 1} 0 obj\n${object}\nendobj\n`;
+  });
+  const xrefOffset = documentText.length;
+  documentText += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  offsets.slice(1).forEach((offset) => {
+    documentText += `${String(offset).padStart(10, "0")} 00000 n \n`;
+  });
+  documentText += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF`;
+  return Uint8Array.from(documentText, (character) => character.charCodeAt(0));
+}
+
+function getLabelDimensions() {
+  const preset = $("#labelSize")?.value ?? "50x30";
+  if (preset !== "custom") {
+    const [width, height] = preset.split("x").map(Number);
+    return { width, height };
+  }
+  const width = Number($("#customLabelWidth")?.value);
+  const height = Number($("#customLabelHeight")?.value);
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width < 15 || width > 100 || height < 10 || height > 100) {
+    throw new Error("No tamanho personalizado, informe largura de 15 a 100 mm e altura de 10 a 100 mm.");
+  }
+  return { width, height };
+}
+
+function getSelectedLabelItems() {
+  return state.labelProducts.flatMap((product) => {
+    const copies = Number(state.labelCopies[product.id] ?? 0);
+    return copies > 0 ? [{ product, copies }] : [];
+  });
+}
+
+function renderBarcodeLabel(product, dimensions, showName, showPrice) {
+  const validBarcode = barcodeSvg(product.barcode);
+  return `<article class="barcode-label ${validBarcode ? "" : "barcode-invalid"}" style="--label-width:${dimensions.width}mm;--label-height:${dimensions.height}mm;width:${dimensions.width}mm;height:${dimensions.height}mm">
+    ${showName ? `<strong class="barcode-product-name">${escapeHtml(product.name)}</strong>` : ""}
+    ${validBarcode || `<span class="barcode-error">Código EAN inválido</span>`}
+    ${showPrice ? `<span class="barcode-product-price">${formatMoney(product.price_cents)}</span>` : ""}
+  </article>`;
+}
+
+function updateBarcodePreview() {
+  const preview = $("#barcodePreview");
+  if (!preview) return;
+  const selection = getSelectedLabelItems();
+  const total = selection.reduce((sum, item) => sum + item.copies, 0);
+  $("#labelCount").textContent = `${total}/${MAX_LABEL_COPIES} etiquetas selecionadas`;
+  $("#downloadBarcodeLabelsPdf").disabled = total === 0 || total > MAX_LABEL_COPIES;
+  if (total > MAX_LABEL_COPIES) {
+    preview.innerHTML = "";
+    $("#labelSizeError").textContent = `O limite é de ${MAX_LABEL_COPIES} etiquetas por folha.`;
+    return;
+  }
+  try {
+    const dimensions = getLabelDimensions();
+    const qualityHint = $("#barcodeQualityHint");
+    const code = code128Barcode(state.labelProducts.find((product) => product.barcode)?.barcode);
+    const moduleWidthMm = code ? (dimensions.width - 2.2) / code.moduleCount : 0;
+    qualityHint.textContent = moduleWidthMm < 0.19
+      ? "Atenção: esta etiqueta é estreita para o Code 128. O código pode não ser lido por alguns leitores; aumente a largura da etiqueta se possível."
+      : "O código usa Code 128 para que leitores retornem os 13 dígitos sem interpretar a faixa interna 20–29 como preço/peso. Habilite Code 128 no leitor e imprima em tamanho real, sem economia de tinta.";
+    qualityHint.classList.toggle("notice", moduleWidthMm < 0.19);
+    const showName = $("#labelShowName").checked;
+    const showPrice = $("#labelShowPrice").checked;
+    const labels = selection.flatMap(({ product, copies }) =>
+      Array.from({ length: copies }, () => renderBarcodeLabel(product, dimensions, showName, showPrice)));
+    preview.style.setProperty("--label-width", `${dimensions.width}mm`);
+    preview.style.setProperty("--label-height", `${dimensions.height}mm`);
+    preview.innerHTML = labels.length
+      ? labels.join("")
+      : `<div class="panel empty label-preview-empty">Selecione produtos e informe a quantidade de etiquetas para visualizar.</div>`;
+    $("#labelSizeError").textContent = "";
+  } catch (error) {
+    preview.innerHTML = "";
+    $("#labelSizeError").textContent = error.message;
+    $("#downloadBarcodeLabelsPdf").disabled = true;
+  }
+}
+
+function downloadBarcodeLabelsPdf() {
+  const selection = getSelectedLabelItems();
+  const total = selection.reduce((sum, item) => sum + item.copies, 0);
+  if (!total || total > MAX_LABEL_COPIES) {
+    throw new Error(`Selecione de 1 a ${MAX_LABEL_COPIES} etiquetas para gerar o PDF.`);
+  }
+  const invalidProduct = selection.find(({ product }) => !code128Barcode(product.barcode));
+  if (invalidProduct) throw new Error(`O código interno de "${invalidProduct.product.name}" é inválido.`);
+  const dimensions = getLabelDimensions();
+  const labels = selection.flatMap(({ product, copies }) => Array.from({ length: copies }, () => product));
+  const pdf = pdfBarcodeBytes(labels, dimensions, $("#labelShowName").checked, $("#labelShowPrice").checked);
+  const url = URL.createObjectURL(new Blob([pdf], { type: "application/pdf" }));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `etiquetas-${new Date().toISOString().slice(0, 10)}.pdf`;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
+}
+
+async function renderBarcodeLabels() {
+  state.labelProducts = await api(`/api/products?branchId=${state.branchId}`);
+  const selectedIds = new Set(state.labelProducts.map((product) => product.id));
+  state.labelCopies = Object.fromEntries(Object.entries(state.labelCopies)
+    .filter(([productId]) => selectedIds.has(Number(productId))));
+  $("#view-labels").innerHTML = `
+    ${heading("Etiquetas de produtos", "Gere etiquetas Code 128 para os códigos internos cadastrados nos produtos.")}
+    <section class="panel label-settings">
+      <div class="label-settings-grid">
+        <label>Tamanho da etiqueta
+          <select id="labelSize">
+            <option value="30x20">Pequena · 30 × 20 mm</option>
+            <option value="40x25">Compacta · 40 × 25 mm</option>
+            <option value="50x30" selected>Média · 50 × 30 mm</option>
+            <option value="60x40">Grande · 60 × 40 mm</option>
+            <option value="custom">Personalizado</option>
+          </select>
+        </label>
+        <div id="customLabelSize" class="custom-label-size hidden">
+          <label>Largura (mm)<input id="customLabelWidth" type="number" min="15" max="100" step="1" value="50"></label>
+          <label>Altura (mm)<input id="customLabelHeight" type="number" min="10" max="100" step="1" value="30"></label>
+        </div>
+        <label class="label-search">Buscar produto<input id="labelProductSearch" type="search" placeholder="Nome, SKU ou código de barras"></label>
+        <div class="label-display-options">
+          <label><input id="labelShowName" type="checkbox" checked> Imprimir nome do produto</label>
+          <label><input id="labelShowPrice" type="checkbox" checked> Imprimir preço</label>
+        </div>
+        <div class="label-print-actions">
+          <strong id="labelCount">0 etiquetas selecionadas</strong>
+          <button id="downloadBarcodeLabelsPdf" class="button primary" type="button" disabled>Gerar PDF</button>
+        </div>
+      </div>
+      <p id="labelSizeError" class="form-error" role="alert"></p>
+      <p id="barcodeQualityHint" class="hint label-print-hint" aria-live="polite"></p>
+      <p class="hint label-print-hint">O PDF é gerado em A4 com as medidas escolhidas. Os códigos internos são impressos em Code 128 para evitar a interpretação especial de faixas EAN internas. Habilite Code 128 no leitor; ao imprimir, selecione escala de 100% ou tamanho real e evite o modo rascunho/economia de tinta. Não são códigos comerciais GS1.</p>
+    </section>
+    <section class="panel label-products-panel">
+      <div class="panel-head"><h2>Produtos e quantidade de etiquetas</h2><span class="muted small">Informe 0 para não imprimir</span></div>
+      ${state.labelProducts.length ? `<div id="labelProductList" class="label-product-list">
+        ${state.labelProducts.map((product) => `<label class="label-product-row" data-search="${escapeHtml([product.name, product.sku, product.barcode].join(" "))}">
+          ${productImage(product, "label-product-image")}
+          <span class="label-product-copy"><strong>${escapeHtml(product.name)}</strong><small>Code 128: ${escapeHtml(product.barcode)} · SKU: ${escapeHtml(product.sku)}</small></span>
+          <span class="label-product-price">${formatMoney(product.price_cents)}</span>
+          <span class="label-copy-input"><span>Etiquetas</span><input type="number" min="0" max="${MAX_LABEL_COPIES}" step="1" value="${Number(state.labelCopies[product.id] ?? 0)}" data-label-copies="${product.id}" aria-label="Quantidade de etiquetas para ${escapeHtml(product.name)}"></span>
+        </label>`).join("")}
+      </div>` : `<div class="empty">Nenhum produto cadastrado nesta unidade.</div>`}
+    </section>
+    <section class="panel label-preview-panel">
+      <div class="panel-head"><h2>Pré-visualização</h2><span class="muted small">A impressão é organizada em páginas A4</span></div>
+      <div id="barcodePreview" class="barcode-preview"></div>
+    </section>`;
+  updateBarcodePreview();
+}
+
+async function renderCustomers() {
+  const customers = await api("/api/customers");
+  $("#view-customers").innerHTML = `
+    ${heading("Clientes", "Mantenha os dados de contato e associe clientes às vendas.")}
+    <form id="customerForm" class="panel form-section">
+      <h2>Novo cliente</h2>
+      <div class="form-grid">
+        <label>Nome<input name="name" required maxlength="160"></label>
+        <label>Telefone<input name="phone" type="tel" maxlength="40"></label>
+        <label class="wide">E-mail<input name="email" type="email" maxlength="160"></label>
+      </div>
+      <div class="form-actions"><button class="button primary" type="submit">Cadastrar cliente</button></div>
+    </form>
+    <section class="panel"><div class="panel-head"><h2>Clientes cadastrados</h2><input id="customerSearch" class="search-field" type="search" placeholder="Buscar cliente"></div>
+      ${customers.length ? `<div class="table-wrap"><table><thead><tr><th>Nome</th><th>Telefone</th><th>E-mail</th></tr></thead><tbody>
+        ${customers.map((customer) => `<tr data-search="${escapeHtml([customer.name, customer.phone, customer.email].join(" "))}"><td><strong>${escapeHtml(customer.name)}</strong></td><td>${escapeHtml(customer.phone || "—")}</td><td>${escapeHtml(customer.email || "—")}</td></tr>`).join("")}
+      </tbody></table></div>` : `<div class="empty">Nenhum cliente cadastrado.</div>`}
+    </section>`;
+}
+
+async function renderCash() {
+  const cash = await api(`/api/cash?branchId=${state.branchId}`);
+  if (!cash.open) {
+    $("#view-cash").innerHTML = `
+      ${heading("Caixa", "Abra o caixa no início do turno e faça o fechamento ao terminar.")}
+          <form id="openCashForm" class="panel form-section narrow-panel">
+        <div class="cash-state closed"><span>●</span> Caixa fechado</div>
+        <p class="muted">Informe o valor inicial disponível em dinheiro.</p>
+        <label>Fundo de caixa (R$)<input name="opening" type="number" min="0" step="0.01" value="0.00" required></label>
+        <div class="form-actions"><button class="button primary" type="submit">Abrir caixa</button></div>
+      </form>`;
+    return;
+  }
+  const movements = cash.movements.map((movement) => `<tr><td>${escapeHtml(new Date(`${movement.created_at.replace(" ", "T")}Z`).toLocaleString("pt-BR"))}</td>
+    <td>${movement.kind === "IN" ? "Entrada" : "Saída"}</td><td>${escapeHtml(movement.note)}</td>
+    <td>${movement.kind === "IN" ? "+" : "−"}${formatMoney(movement.amount_cents)}</td></tr>`).join("");
+  $("#view-cash").innerHTML = `
+    ${heading("Caixa", "Acompanhe entradas, saídas e valores do turno.")}
+    <div class="cash-state"><span class="status-dot"></span> Caixa aberto desde ${escapeHtml(new Date(`${cash.opened_at.replace(" ", "T")}Z`).toLocaleString("pt-BR"))}</div>
+    <div class="stats-grid section-spacer">
+      <div class="stat-card"><span>Fundo inicial</span><strong>${formatMoney(cash.opening_cents)}</strong></div>
+      <div class="stat-card"><span>Vendas em dinheiro</span><strong>${formatMoney(cash.cash_sales_cents)}</strong></div>
+      <div class="stat-card"><span>Saldo esperado no caixa</span><strong>${formatMoney(cash.expected_cents)}</strong></div>
+    </div>
+    <div class="sales-grid">
+      <form id="cashMovementForm" class="panel form-section">
+        <h2>Lançar movimentação</h2>
+        <div class="form-grid">
+          <label>Tipo<select name="kind"><option value="IN">Entrada</option><option value="OUT">Saída</option></select></label>
+          <label>Valor (R$)<input name="amount" type="number" min="0.01" step="0.01" required></label>
+          <label class="wide">Descrição<input name="note" required maxlength="200" placeholder="Ex.: retirada para depósito"></label>
+        </div>
+        <div class="form-actions"><button class="button secondary" type="submit">Registrar</button></div>
+      </form>
+      <form id="closeCashForm" class="panel form-section">
+        <h2>Fechar caixa</h2>
+        <p class="muted">Conte o dinheiro físico. O sistema mostrará a diferença em relação ao esperado.</p>
+        <label>Valor contado (R$)<input name="closing" type="number" min="0" step="0.01" required></label>
+        <div class="form-actions"><button class="button primary" type="submit">Fechar turno</button></div>
+      </form>
+    </div>
+    <section class="panel section-spacer"><div class="panel-head"><h2>Movimentações recentes</h2><span class="muted small">Até 50 lançamentos</span></div>
+      ${movements ? `<div class="table-wrap"><table><thead><tr><th>Data</th><th>Tipo</th><th>Descrição</th><th>Valor</th></tr></thead><tbody>${movements}</tbody></table></div>` : `<div class="empty">Nenhuma movimentação manual.</div>`}
+    </section>`;
+}
+
+function dateInputValue(date) {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+}
+
+async function renderReports() {
+  const month = dateInputValue(new Date()).slice(0, 7);
+  $("#view-reports").innerHTML = `
+    ${heading("Relatório mensal", "Fechamento gerencial completo da unidade, pronto para imprimir ou salvar em PDF.")}
+    <form id="reportForm" class="panel form-section">
+      <div class="filters">
+        <label>Mês do relatório<input name="month" type="month" value="${month}" required></label>
+        <button class="button primary" type="submit">Gerar relatório</button>
+        <button id="printMonthlyReport" class="button secondary" type="button" disabled>Imprimir / Salvar em PDF</button>
+        <button id="exportSales" class="button secondary" type="button" disabled>Exportar vendas CSV</button>
+      </div>
+    </form>
+    <div id="reportResults" class="section-spacer">
+      <div class="panel report-loading">Preparando relatório mensal completo…</div>
+    </div>`;
+  await loadReport(month);
+}
+
+function formatReportDate(value, includeTime = false) {
+  if (!value) return "—";
+  const date = new Date(value.includes("T") ? value : `${value.replace(" ", "T")}Z`);
+  if (!Number.isFinite(date.getTime())) return escapeHtml(value);
+  return new Intl.DateTimeFormat("pt-BR", includeTime
+    ? { dateStyle: "short", timeStyle: "short" }
+    : { dateStyle: "short", timeZone: "UTC" }).format(date);
+}
+
+function reportTable(headers, rows, emptyMessage) {
+  if (!rows.length) return `<div class="report-empty">${escapeHtml(emptyMessage)}</div>`;
+  return `<div class="report-table-wrap"><table class="report-table"><thead><tr>${headers.map((header) => `<th>${header}</th>`).join("")}</tr></thead><tbody>
+    ${rows.map((row) => `<tr>${row.map((cell) => `<td>${cell}</td>`).join("")}</tr>`).join("")}
+    </tbody></table></div>`;
+}
+
+function reportSection(title, description, headers, rows, emptyMessage) {
+  return `<section class="report-section"><div class="report-section-title"><div><h2>${title}</h2><p>${description}</p></div></div>${reportTable(headers, rows, emptyMessage)}</section>`;
+}
+
+function buildMonthlyReport(report, month) {
+  const monthLabel = new Intl.DateTimeFormat("pt-BR", { month: "long", year: "numeric", timeZone: "UTC" })
+    .format(new Date(`${month}-01T00:00:00.000Z`));
+  const completed = report.methods.filter((row) => row.status === "COMPLETED");
+  const cancelled = report.methods.filter((row) => row.status === "CANCELED");
+  const paymentMethods = [...new Set(report.methods.map((row) => row.method))];
+  const methodsByStatus = (rows, method) => rows.find((row) => row.method === method)?.amount_cents ?? 0;
+  const cashOut = report.cashMovements.filter((movement) => movement.kind === "OUT")
+    .reduce((sum, movement) => sum + movement.amount_cents, 0);
+  const cashIn = report.cashMovements.filter((movement) => movement.kind === "IN")
+    .reduce((sum, movement) => sum + movement.amount_cents, 0);
+  const pageGenerated = new Intl.DateTimeFormat("pt-BR", { dateStyle: "short", timeStyle: "short" }).format(new Date());
+  const metric = (label, value, detail = "") => `<div class="report-metric"><span>${label}</span><strong>${value}</strong>${detail ? `<small>${detail}</small>` : ""}</div>`;
+  const salesRows = report.sales.map((sale) => [
+    `#${sale.id}`,
+    formatReportDate(sale.created_at, true),
+    escapeHtml(sale.cashier),
+    escapeHtml(sale.customer || "Consumidor"),
+    escapeHtml(sale.payment_methods ?? "—"),
+    formatMoney(sale.subtotal_cents),
+    formatMoney(sale.discount_cents),
+    formatMoney(sale.total_cents),
+    `${sale.status === "CANCELED" ? "Cancelada" : "Concluída"}${sale.canceled_at ? `<small class="report-cell-note">Em ${formatReportDate(sale.canceled_at, true)}</small>` : ""}${sale.cancel_reason ? `<small class="report-cell-note">${escapeHtml(sale.cancel_reason)}</small>` : ""}`,
+  ]);
+  const itemRows = report.saleItems.map((item) => [
+    `#${item.sale_id}`,
+    formatReportDate(item.created_at, true),
+    escapeHtml(item.product_name),
+    item.quantity,
+    formatMoney(item.unit_price_cents),
+    formatMoney(item.total_cents),
+    item.status === "CANCELED" ? "Cancelada/estornada" : "Concluída",
+  ]);
+  const dailyRows = report.daily.map((day) => [
+    formatReportDate(day.sale_date),
+    day.sale_count,
+    formatMoney(day.subtotal_cents),
+    formatMoney(day.discount_cents),
+    `<strong>${formatMoney(day.total_cents)}</strong>`,
+    `${day.canceled_count} · ${formatMoney(day.canceled_total_cents)}`,
+  ]);
+  const paymentRows = paymentMethods.map((method) => [
+    escapeHtml(paymentLabels[method] ?? method),
+    formatMoney(methodsByStatus(completed, method)),
+    formatMoney(methodsByStatus(cancelled, method)),
+  ]);
+  const productRows = report.products.map((product) => [
+    product.channel === "SITE" ? "Site" : "PDV",
+    escapeHtml(product.product_name),
+    product.quantity,
+    product.sale_count,
+    formatMoney(product.item_total_cents),
+  ]);
+  const siteDailyRows = report.siteDaily.map((day) => [
+    formatReportDate(day.order_date),
+    day.order_count,
+    formatMoney(day.total_cents),
+  ]);
+  const siteOrderRows = report.siteSales.map((order) => [
+    escapeHtml(order.order_id),
+    formatReportDate(order.created_at, true),
+    order.item_count,
+    formatMoney(order.total_cents),
+    "Pedido registrado · sem pagamento",
+  ]);
+  const siteItemRows = report.siteSaleItems.map((item) => [
+    escapeHtml(item.order_id),
+    formatReportDate(item.created_at, true),
+    escapeHtml(item.product_name),
+    item.quantity,
+    formatMoney(item.unit_price_cents),
+    formatMoney(item.total_cents),
+    "Pedido do site · sem pagamento",
+  ]);
+  const cashierRows = report.cashiers.map((cashier) => [
+    escapeHtml(cashier.cashier),
+    cashier.sale_count,
+    formatMoney(cashier.total_cents),
+    cashier.canceled_count,
+  ]);
+  const cashRows = report.cashSessions.map((session) => {
+    const closed = Boolean(session.closed_at);
+    const difference = closed ? session.closing_cents - session.expected_cents : null;
+    return [
+      `Caixa #${session.id}`,
+      escapeHtml(session.cashier),
+      formatReportDate(session.opened_at, true),
+      closed ? formatReportDate(session.closed_at, true) : "Aberto no fim do período",
+      formatMoney(session.opening_cents),
+      formatMoney(session.expected_cents),
+      closed ? formatMoney(session.closing_cents) : "—",
+      closed ? formatMoney(difference) : "—",
+    ];
+  });
+  const cashMovementRows = report.cashMovements.map((movement) => [
+    formatReportDate(movement.created_at, true),
+    movement.kind === "IN" ? "Suprimento/entrada" : "Sangria/saída",
+    escapeHtml(movement.note),
+    escapeHtml(movement.user_name),
+    movement.kind === "IN" ? `+${formatMoney(movement.amount_cents)}` : `−${formatMoney(movement.amount_cents)}`,
+  ]);
+  const movementNames = {
+    IN: "Entrada", OUT: "Saída", SALE: "Venda", CANCEL: "Cancelamento",
+    TRANSFER_IN: "Transferência recebida", TRANSFER_OUT: "Transferência enviada",
+  };
+  const stockRows = report.stockMovements.map((movement) => [
+    formatReportDate(movement.created_at, true),
+    escapeHtml(movement.product_name),
+    escapeHtml(movement.source === "SITE"
+      ? "Venda pelo site"
+      : movementNames[movement.kind] ?? movement.kind),
+    movement.quantity,
+    escapeHtml(movement.note || "—"),
+    escapeHtml(movement.user_name),
+    movement.sale_id ? `#${movement.sale_id}` : "—",
+  ]);
+  const inventoryRows = report.inventory.map((product) => [
+    escapeHtml(product.name),
+    escapeHtml(product.sku ?? "—"),
+    product.quantity,
+    product.min_stock,
+    product.quantity <= product.min_stock ? "Repor" : "Normal",
+  ]);
+  const from = report.from ? formatReportDate(report.from) : "Todo o período";
+  const to = report.to ? formatReportDate(report.to) : "Todo o período";
+  const statusText = report.sale_count === 0 && report.canceled_count === 0 && report.site_order_count === 0
+    ? "Sem movimentação de vendas ou pedidos no período"
+    : `${report.sale_count} venda(s) no PDV, ${report.site_order_count} pedido(s) do site sem pagamento e ${report.canceled_count} venda(s) cancelada(s)`;
+
+  return `<article id="monthlyReportDocument" class="monthly-report">
+    <header class="report-cover">
+      <div class="report-brand"><span class="report-brand-mark">P</span><div><strong>PontoCerto</strong><span>GESTÃO DE VENDAS</span></div></div>
+      <p class="report-kicker">RELATÓRIO GERENCIAL · NÃO FISCAL</p>
+      <h1>Fechamento mensal</h1>
+      <p class="report-period">${escapeHtml(monthLabel)}</p>
+      <div class="report-metadata"><span><small>Unidade</small><strong>${escapeHtml(report.branch.name)}</strong></span>
+        <span><small>Período analisado</small><strong>${escapeHtml(from)} a ${escapeHtml(to)}</strong></span>
+        <span><small>Gerado em</small><strong>${escapeHtml(pageGenerated)}</strong></span></div>
+      <p class="report-status">${escapeHtml(statusText)}</p>
+    </header>
+    <section class="report-summary">
+      <h2>Resumo executivo</h2>
+      <div class="report-metrics">
+        ${metric("Vendas concluídas no PDV", report.sale_count)}
+        ${metric("Faturamento recebido no PDV", formatMoney(report.total_cents))}
+        ${metric("Pedidos do site (sem pagamento)", report.site_order_count)}
+        ${metric("Valor dos pedidos do site (não recebido)", formatMoney(report.site_order_total_cents))}
+        ${metric("Descontos no PDV", formatMoney(report.discount_cents))}
+        ${metric("Ticket médio no PDV", formatMoney(report.average_ticket_cents))}
+        ${metric("Vendas canceladas no PDV", report.canceled_count)}
+        ${metric("Valor cancelado no PDV", formatMoney(report.canceled_total_cents))}
+      </div>
+      <p class="report-summary-note">O faturamento recebido considera somente as vendas registradas no caixa. Pedidos do site aparecem separados, sem representar pagamento ou entrada de dinheiro. Vendas canceladas não entram no faturamento.</p>
+    </section>
+    ${reportSection("Fechamento diário do PDV", "Vendas registradas no caixa; cancelamentos ficam identificados separadamente.",
+      ["Data", "Vendas", "Subtotal", "Descontos", "Faturamento", "Cancelamentos"], dailyRows, "Nenhuma venda no período selecionado.")}
+    ${reportSection("Pedidos do site por dia", "Pedidos recebidos do site, sem pagamento processado e sem efeito no caixa.",
+      ["Data", "Pedidos", "Valor dos pedidos (não recebido)"], siteDailyRows, "Nenhum pedido do site no período selecionado.")}
+    ${reportSection("Formas de pagamento do PDV", "Valores registrados por meio de pagamento no caixa. Pedidos do site não são pagamentos.",
+      ["Meio", "Concluídos", "Cancelados"], paymentRows, "Sem pagamentos registrados no período.")}
+    ${reportSection("Desempenho por operador do PDV", "Vendas concluídas e cancelamentos agrupados pelo usuário que registrou a venda no caixa.",
+      ["Operador", "Vendas", "Faturamento", "Cancelamentos"], cashierRows, "Nenhuma venda registrada no período.")}
+    ${reportSection("Produtos vendidos ou pedidos", "Itens de vendas do PDV e de pedidos do site aparecem identificados por origem.",
+      ["Origem", "Produto", "Quantidade", "Vendas/pedidos", "Total dos itens"], productRows, "Nenhum produto vendido ou pedido no período.")}
+    ${reportSection("Conferência de caixa", "Caixas abertos ou encerrados no período. Diferença compara o valor contado no fechamento com o saldo esperado em dinheiro.",
+      ["Caixa", "Operador", "Abertura", "Fechamento", "Fundo inicial", "Esperado", "Contado", "Diferença"], cashRows, "Nenhum caixa aberto no período.")}
+    ${reportSection("Suprimentos e sangrias", `Movimentações manuais de caixa. Entradas: ${formatMoney(cashIn)} · Saídas: ${formatMoney(cashOut)}.`,
+      ["Data", "Tipo", "Descrição", "Usuário", "Valor"], cashMovementRows, "Nenhuma movimentação manual de caixa no período.")}
+    ${reportSection("Movimentações de estoque", "Entradas, saídas, vendas, cancelamentos e transferências registradas no período.",
+      ["Data", "Produto", "Movimento", "Qtd.", "Observação", "Usuário", "Venda"], stockRows, "Nenhuma movimentação de estoque no período.")}
+    ${reportSection("Vendas detalhadas no PDV", "Uma linha por venda registrada no caixa; cancelamentos, descontos e formas de pagamento ficam discriminados.",
+      ["Venda", "Data e hora", "Operador", "Cliente", "Pagamento", "Subtotal", "Desconto", "Total", "Status / motivo"], salesRows, "Nenhuma venda no período selecionado.")}
+    ${reportSection("Itens por venda", "Detalhamento dos itens. Linhas de vendas canceladas são marcadas como estornadas.",
+      ["Venda", "Data e hora", "Produto", "Qtd.", "Unitário", "Total do item", "Status"], itemRows, "Nenhum item de venda no período.")}
+    ${reportSection("Pedidos detalhados do site", "Pedidos de teste recebidos do site; os valores são informativos e não representam vendas pagas.",
+      ["Pedido do site", "Data e hora", "Itens", "Valor do pedido (não recebido)", "Situação"], siteOrderRows, "Nenhum pedido do site no período selecionado.")}
+    ${reportSection("Itens por pedido do site", "Detalhamento dos itens recebidos do site. Esses pedidos não movimentam o caixa.",
+      ["Pedido do site", "Data e hora", "Produto", "Qtd.", "Unitário", "Total do item", "Situação"], siteItemRows, "Nenhum item de pedido do site no período.")}
+    ${reportSection("Posição atual do estoque", "Saldo atual da unidade no momento da emissão; não representa uma posição histórica no último dia do mês.",
+      ["Produto", "SKU", "Saldo atual", "Mínimo", "Situação"], inventoryRows, "Nenhum produto ativo cadastrado.")}
+    <footer class="report-footer">
+      <p>Documento gerencial para conferência interna. Não é documento fiscal nem substitui conferência contábil.</p>
+      <p>Os pagamentos são registros manuais no sistema; valide Pix e cartão junto ao provedor/maquininha. O custo histórico por venda não é armazenado, portanto o relatório não calcula lucro ou margem.</p>
+      <span>PontoCerto PDV · ${escapeHtml(report.branch.name)} · ${escapeHtml(monthLabel)}</span>
+    </footer>
+  </article>`;
+}
+
+async function loadReport(month) {
+  if (!/^\d{4}-\d{2}$/.test(month)) throw new Error("Selecione um mês válido.");
+  const [year, monthNumber] = month.split("-").map(Number);
+  if (monthNumber < 1 || monthNumber > 12) throw new Error("Selecione um mês válido.");
+  const lastDay = new Date(Date.UTC(year, monthNumber, 0)).getUTCDate();
+  const from = `${month}-01`;
+  const to = `${month}-${String(lastDay).padStart(2, "0")}`;
+  const report = await api(`/api/reports?branchId=${state.branchId}&from=${from}&to=${to}`);
+  if (!Array.isArray(report.siteDaily) || !Array.isArray(report.siteSales)
+    || !Array.isArray(report.siteSaleItems) || !Number.isInteger(report.site_order_count)
+    || !Number.isInteger(report.site_order_total_cents)) {
+    throw new Error("Reinicie o servidor do PDV para atualizar o relatório com os pedidos do site.");
+  }
+  $("#reportResults").innerHTML = buildMonthlyReport(report, month);
+  $("#printMonthlyReport").disabled = false;
+  $("#exportSales").disabled = false;
+  $("#exportSales").onclick = () => downloadSalesCsv(report.sales, report.siteSales, month);
+  $("#printMonthlyReport").onclick = () => printMonthlyReport(report, month);
+}
+
+function printMonthlyReport(report, month) {
+  const root = $("#printRoot");
+  root.innerHTML = buildMonthlyReport(report, month);
+  root.classList.add("monthly-print-root");
+  const previousTitle = document.title;
+  document.title = `Relatorio-mensal-${report.branch.name}-${month}`;
+  const restoreTitle = () => {
+    document.title = previousTitle;
+    root.classList.remove("monthly-print-root");
+    window.removeEventListener("afterprint", restoreTitle);
+  };
+  window.addEventListener("afterprint", restoreTitle, { once: true });
+  window.print();
+  setTimeout(restoreTitle, 60_000);
+}
+
+function downloadSalesCsv(sales, siteOrders, month) {
+  const lines = [["Origem", "Venda/pedido", "Data e hora", "Operador", "Cliente", "Pagamento", "Subtotal (centavos)", "Desconto (centavos)", "Total (centavos)", "Status", "Motivo do cancelamento"],
+    ...sales.map((sale) => [
+      "PDV", sale.id, sale.created_at, sale.cashier, sale.customer ?? "", sale.payment_methods ?? "",
+      sale.subtotal_cents, sale.discount_cents, sale.total_cents, sale.status, sale.cancel_reason ?? "",
+    ]),
+    ...siteOrders.map((order) => [
+      "Site (sem pagamento)", order.order_id, order.created_at, "Site", "", "Não processado",
+      order.total_cents, 0, order.total_cents, "PEDIDO NÃO PAGO", "",
+    ])];
+  const csv = lines.map((row) => row.map((value) => `"${String(value).replaceAll('"', '""')}"`).join(";")).join("\r\n");
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(new Blob(["\ufeff", csv], { type: "text/csv;charset=utf-8" }));
+  link.download = `relatorio-vendas-${month}.csv`;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+}
+
+async function renderSettings() {
+  const [branches, users] = await Promise.all([
+    api("/api/branches"),
+    state.user.role === "ADMIN" ? api("/api/users") : Promise.resolve([]),
+  ]);
+  state.branches = branches;
+  $("#view-settings").innerHTML = `
+    ${heading("Administração", "Gerencie unidades de atendimento e acessos ao sistema.")}
+    <div class="notice">Os usuários têm acesso às unidades cadastradas. Proteja a conta de administrador e use senhas individuais.</div>
+    <div class="sales-grid section-spacer">
+      <form id="branchForm" class="panel form-section">
+        <h2>Adicionar unidade</h2>
+        <label>Nome da unidade<input name="name" required maxlength="100"></label>
+        <div class="form-actions"><button class="button primary" type="submit">Cadastrar unidade</button></div>
+      </form>
+      <form id="userForm" class="panel form-section">
+        <h2>Novo usuário</h2>
+        <div class="form-grid">
+          <label>Nome<input name="name" required maxlength="100"></label>
+          <label>Usuário de acesso<input name="username" required maxlength="50"></label>
+          <label>Perfil<select name="role"><option value="CASHIER">Operador</option><option value="MANAGER">Gerente</option></select></label>
+          <label>Senha (mínimo 12 caracteres)<input name="password" type="password" minlength="12" required maxlength="200"></label>
+        </div>
+        <div class="form-actions"><button class="button primary" type="submit">Criar usuário</button></div>
+      </form>
+    </div>
+    <div class="sales-grid section-spacer">
+      <section class="panel"><div class="panel-head"><h2>Unidades</h2></div>
+        <div class="table-wrap"><table><thead><tr><th>Unidade</th><th>Status</th></tr></thead><tbody>
+          ${branches.map((branch) => `<tr><td>${escapeHtml(branch.name)}</td><td><span class="badge">Ativa</span></td></tr>`).join("")}
+        </tbody></table></div>
+      </section>
+      ${state.user.role === "ADMIN" ? `<section class="panel"><div class="panel-head"><h2>Usuários</h2></div>
+        <div class="table-wrap"><table><thead><tr><th>Nome</th><th>Perfil</th><th>Status</th><th>Ação</th></tr></thead><tbody>
+          ${users.map((account) => `<tr><td><strong>${escapeHtml(account.name)}</strong><br><span class="muted">${escapeHtml(account.username)}</span></td>
+            <td>${roleLabels[account.role]}</td><td>${account.active ? "Ativo" : "Inativo"}</td>
+            <td>${account.id !== state.user.id ? `<button class="button ${account.active ? "danger" : "secondary"}" type="button" data-action="toggle-user" data-id="${account.id}" data-active="${account.active ? "false" : "true"}">${account.active ? "Desativar" : "Ativar"}</button>` : "—"}</td>
+          </tr>`).join("")}
+        </tbody></table></div>
+      </section>` : ""}
+    </div>`;
+}
+
+function resetProductForm() {
+  const form = $("#productForm");
+  if (!form) return;
+  form.reset();
+  form.elements.productId.value = "";
+  $("#productDescriptionCount").textContent = "0/1000 caracteres";
+  form.elements.cost.value = "";
+  form.elements.minStock.value = "";
+  form.elements.quantity.value = "";
+  form.elements.images.value = "";
+  form.elements.images.required = true;
+  $("#productSizeTypeSelect").disabled = false;
+  $("#productImageInput").multiple = true;
+  $("#productImageSelectionHint").textContent = "Nenhuma imagem selecionada.";
+  $("#removeProductImage").checked = false;
+  $("#removeProductImageLabel").classList.add("hidden");
+  state.productImageData = undefined;
+  state.productImagesData = [];
+  state.productImagesPromise = Promise.resolve([]);
+  state.productImageDirty = false;
+  state.productColorRows = [];
+  clearProductImagePreview();
+  $("#productFormTitle").textContent = "Novo produto";
+  $("#initialQuantityLabel").classList.remove("hidden");
+  $("#cancelProductEdit").classList.add("hidden");
+  updateProductCategoryFields([]);
+}
+
+function changeCartQuantity(productId, delta, variantId = null) {
+  const item = state.cart.find((entry) => entry.id === productId && (entry.variantId ?? null) === variantId);
+  const product = state.products.find((entry) => entry.id === productId);
+  if (!item || !product) return;
+  const variant = variantId ? product.variants?.find((entry) => entry.id === variantId) : null;
+  const stock = variant ? variant.quantity : product.quantity;
+  state.selectedProductId = productId;
+  const next = item.quantity + delta;
+  if (next < 1) {
+    state.cart = state.cart.filter((entry) => !(entry.id === productId && (entry.variantId ?? null) === variantId));
+    if (state.selectedProductId === productId) state.selectedProductId = state.cart.at(-1)?.id ?? null;
+  }
+  else if (next <= stock) item.quantity = next;
+  else return showToast("A quantidade supera o estoque disponível para este tamanho.", true);
+  renderSales().catch((error) => showToast(error.message, true));
+}
+
+async function showReceipt(saleId) {
+  const sale = await api(`/api/sales/${saleId}`);
+  const printRoot = $("#printRoot");
+  printRoot.innerHTML = `
+    <h1>${escapeHtml(sale.branch_name)}</h1>
+    <p>Comprovante não fiscal — venda #${sale.id}</p>
+    <p>Data: ${escapeHtml(new Date(`${sale.created_at.replace(" ", "T")}Z`).toLocaleString("pt-BR"))}</p>
+    <p>Operador: ${escapeHtml(sale.cashier)}${sale.customer ? ` · Cliente: ${escapeHtml(sale.customer)}` : ""}</p>
+    <table><thead><tr><th>Produto</th><th>Qtd.</th><th>Unitário</th><th>Total</th></tr></thead><tbody>
+      ${sale.items.map((item) => `<tr><td>${escapeHtml(item.product_name)}</td><td>${item.quantity}</td><td>${formatMoney(item.unit_price_cents)}</td><td>${formatMoney(item.total_cents)}</td></tr>`).join("")}
+    </tbody></table>
+    <p>Subtotal: ${formatMoney(sale.subtotal_cents)}</p><p>Desconto: ${formatMoney(sale.discount_cents)}</p>
+    <p><strong>Total: ${formatMoney(sale.total_cents)}</strong></p>
+    <p>Pagamento: ${sale.payments.map((payment) => `${paymentLabels[payment.method]} ${formatMoney(payment.amount_cents)}`).join(" · ")}</p>
+    ${sale.status === "CANCELED" ? `<p>VENDA CANCELADA — ${escapeHtml(sale.cancel_reason)}</p>` : ""}
+    <p>Obrigado pela preferência.</p>`;
+  window.print();
+}
+
+function clearSaleDraft() {
+  state.cart = [];
+  state.selectedProductId = null;
+  state.searchMatchProductId = null;
+  state.lastAutoAddedCode = null;
+  state.paymentRows = [];
+  state.customerId = "";
+  if ($("#discountInput")) $("#discountInput").value = "0.00";
+}
+
+function renderTestReceipt(sale) {
+  const printRoot = $("#printRoot");
+  printRoot.innerHTML = `
+    <h1>${escapeHtml(sale.branchName)}</h1>
+    <h2>COMPROVANTE DE TESTE — SIMULAÇÃO</h2>
+    <p><strong>SEM VALOR REAL · NÃO É COMPROVANTE DE PAGAMENTO</strong></p>
+    <p>Esta simulação não foi registrada no caixa, no estoque ou nos relatórios.</p>
+    <p>Referência: ${escapeHtml(sale.reference)} · ${escapeHtml(new Date(sale.createdAt).toLocaleString("pt-BR"))}</p>
+    <table><thead><tr><th>Produto</th><th>Qtd.</th><th>Unitário</th><th>Total</th></tr></thead><tbody>
+      ${sale.items.map((item) => `<tr><td>${escapeHtml(item.name)}</td><td>${item.quantity}</td><td>${formatMoney(item.price_cents)}</td><td>${formatMoney(item.price_cents * item.quantity)}</td></tr>`).join("")}
+    </tbody></table>
+    <p>Subtotal: ${formatMoney(sale.subtotalCents)}</p><p>Desconto: ${formatMoney(sale.discountCents)}</p>
+    <p><strong>Total simulado: ${formatMoney(sale.totalCents)}</strong></p>
+    <p>Forma(s) simulada(s): ${sale.payments.map((payment) => `${paymentLabels[payment.method]} ${formatMoney(payment.amountCents)}`).join(" · ")}</p>`;
+}
+
+async function openPaymentSimulation(snapshot) {
+  const reference = `TESTE-${Date.now()}`;
+  const request = {
+    method: "POST",
+    body: {
+      reference,
+      amountCents: snapshot.totalCents,
+      subtotalCents: snapshot.subtotalCents,
+      discountCents: snapshot.discountCents,
+      items: snapshot.items.map((item) => ({
+        name: item.name,
+        quantity: item.quantity,
+        unitPriceCents: item.price_cents,
+      })),
+      payments: snapshot.payments.map(({ method, amountCents }) => ({ method, amountCents })),
+    },
+  };
+  let result;
+  try {
+    result = await api("/api/payment-simulator/qr", request);
+  } catch (error) {
+    if (!/simulação aceita|grandes demais para o QR/i.test(error.message)) throw error;
+    state.simulationSnapshot = { ...snapshot, reference, createdAt: new Date().toISOString() };
+    $("#paymentDialogContent").innerHTML = `
+      <div class="dialog-heading">
+        <div><p class="eyebrow">SIMULADOR GRATUITO</p><h2>QR de teste indisponível</h2></div>
+        <button class="button ghost small-button" type="button" data-action="close-payment-dialog">Fechar</button>
+      </div>
+      <div class="notice">${escapeHtml(error.message)} O carrinho foi mantido. Você pode registrar a venda após conferir o pagamento fora do sistema.</div>
+      <div class="form-actions payment-dialog-actions">
+        <button id="registerSaleNormally" class="button primary" type="button">Registrar venda (pagamento conferido fora)</button>
+        <button class="button ghost" type="button" data-action="close-payment-dialog">Voltar</button>
+      </div>`;
+    $("#paymentDialog").showModal();
+    return;
+  }
+  state.simulationSnapshot = { ...snapshot, reference, createdAt: new Date().toISOString() };
+  $("#paymentDialogContent").innerHTML = `
+    <div class="dialog-heading">
+      <div><p class="eyebrow">SIMULADOR GRATUITO</p><h2>Pagamento por QR de teste</h2></div>
+      <button class="button ghost small-button" type="button" data-action="close-payment-dialog">Fechar</button>
+    </div>
+    <div class="payment-simulation">
+      <img class="payment-qr" src="${result.qrCode}" alt="QR code com os dados da compra de teste">
+      <div>
+        <span class="badge">SIMULAÇÃO · SEM COBRANÇA</span>
+        <h3>Total: ${formatMoney(snapshot.totalCents)}</h3>
+        <p>Referência: ${escapeHtml(reference)}</p>
+        <p>Leia o QR para conferir os dados da compra. Ele <strong>não é um Pix</strong> e não movimenta dinheiro.</p>
+        <div class="notice">Para testar o fluxo, o operador confirma a aprovação simulada abaixo. Nenhuma venda, baixa de estoque ou movimentação de caixa será gravada.</div>
+      </div>
+    </div>
+    <div class="form-actions payment-dialog-actions">
+      <button id="confirmTestPayment" class="button primary" type="button">Simular pagamento aprovado</button>
+      <button id="registerSaleNormally" class="button secondary" type="button">Registrar venda (pagamento conferido fora)</button>
+      <button class="button ghost" type="button" data-action="close-payment-dialog">Voltar</button>
+    </div>`;
+  $("#paymentDialog").showModal();
+}
+
+function openReceiptOffer(receiptOffer) {
+  state.receiptOffer = receiptOffer;
+  const isTest = Boolean(receiptOffer.testSale);
+  $("#paymentDialogContent").innerHTML = `
+    <div class="dialog-heading">
+      <div><p class="eyebrow">${isTest ? "SIMULAÇÃO LOCAL" : "VENDA REGISTRADA"}</p>
+        <h2>${isTest ? "Pagamento de teste aprovado" : `Venda #${receiptOffer.saleId} finalizada`}</h2></div>
+    </div>
+    <p>${isTest
+      ? "O comprovante está marcado como teste. Nenhum dado financeiro ou de estoque foi alterado."
+      : "Deseja imprimir o comprovante não fiscal desta venda?"}</p>
+    <div class="form-actions payment-dialog-actions">
+      <button id="printSaleReceipt" class="button primary" type="button">Imprimir comprovante</button>
+      <button id="skipSaleReceipt" class="button secondary" type="button">${isTest ? "Concluir teste" : "Não imprimir"}</button>
+    </div>`;
+  $("#paymentDialog").showModal();
+}
+
+function makeSimulationSnapshot(total) {
+  return {
+    branchName: state.branches.find((branch) => branch.id === state.branchId)?.name ?? "Unidade",
+    items: state.cart.map((item) => ({ ...item })),
+    subtotalCents: total.subtotal,
+    discountCents: total.discount,
+    totalCents: total.total,
+    payments: state.paymentRows.map((payment) => ({
+      method: payment.method,
+      amountCents: payment.amountCents,
+    })),
+  };
+}
+
+async function handleSubmit(event) {
+  const form = event.target;
+  if (!(form instanceof HTMLFormElement)) return;
+  const data = new FormData(form);
+  const value = (name) => String(data.get(name) ?? "").trim();
+  try {
+    if (form.id === "loginForm") {
+      event.preventDefault();
+      const session = await api("/api/auth/login", {
+        method: "POST",
+        body: { username: value("username"), password: value("password") },
+      });
+      state.csrf = session.csrfToken;
+      await enterApplication(await api("/api/me"));
+      form.reset();
+      return;
+    }
+    if (form.id === "passwordForm") {
+      event.preventDefault();
+      if (value("newPassword") !== value("confirmPassword")) {
+        throw new Error("A nova senha e a confirmação não são iguais.");
+      }
+      await api("/api/auth/password", {
+        method: "POST",
+        body: { currentPassword: value("currentPassword"), newPassword: value("newPassword") },
+      });
+      form.reset();
+      $("#passwordDialog").close();
+      showToast("Senha alterada. Outras sessões foram encerradas.");
+      return;
+    }
+    if (form.id === "transferForm") {
+      event.preventDefault();
+      await api("/api/inventory/transfer", {
+        method: "POST",
+        body: {
+          sourceBranchId: state.branchId,
+          targetBranchId: Number(value("targetBranchId")),
+          productId: Number(value("productId")),
+          ...(value("variantId") ? { variantId: Number(value("variantId")) } : {}),
+          quantity: Number(value("quantity")),
+          note: value("note"),
+        },
+      });
+      form.reset();
+      $("#transferDialog").close();
+      showToast("Transferência de estoque concluída.");
+      await renderProducts();
+      return;
+    }
+    if (form.id === "setupForm") {
+      event.preventDefault();
+      await api("/api/setup", {
+        method: "POST",
+        body: {
+          name: value("name"),
+          branchName: value("branchName"),
+          username: value("username"),
+          password: value("password"),
+        },
+      });
+      $("#loginForm").elements.username.value = value("username");
+      form.reset();
+      setAuthMode(false);
+      showToast("Loja configurada. Entre com o usuário administrador.");
+      return;
+    }
+    if (form.id === "productForm") {
+      event.preventDefault();
+      const priceCents = parseMoney(value("price"));
+      const costCents = parseMoney(value("cost"));
+      if (priceCents === null || costCents === null) throw new Error("Informe preços válidos com até duas casas decimais.");
+      const productId = Number(value("productId"));
+      form.elements.name.value = normalizeDisplayName(value("name"));
+      const product = {
+        name: form.elements.name.value,
+        brandId: Number(value("brandId")),
+        sizeType: $("#productSizeTypeSelect").value,
+        categoryId: Number(value("categoryId")),
+        subcategoryId: value("subcategoryId") ? Number(value("subcategoryId")) : null,
+        description: value("description"),
+        priceCents, costCents,
+        minStock: Number(value("minStock")),
+        condition: value("condition") || null,
+      };
+      if (productId) {
+        product.variantPrices = [...form.querySelectorAll("[data-variant-price]")].map(field => {
+          const raw = field.value.trim(), priceCents = raw === "" ? null : parseMoney(raw), variantId = Number(field.dataset.variantPrice);
+          if ((raw !== "" && priceCents === null) || !Number.isSafeInteger(variantId) || variantId < 1) throw new Error("Preço ou variação inválida.");
+          return { variantId, priceCents };
+        });
+      }
+      const sizeMode = !$("#productSizeField").classList.contains("hidden");
+      const selectedVariants = sizeMode
+        ? [...form.querySelectorAll("[data-size-check]:checked")].map((checkbox) => ({
+          size: checkbox.value,
+          quantity: Number(checkbox.closest("[data-size-row]").querySelector("[data-size-qty]").value),
+          _priceInput: checkbox.closest("[data-size-row]").querySelector("[data-size-price]")?.value.trim() ?? "", priceCents: (() => { const field = checkbox.closest("[data-size-row]").querySelector("[data-size-price]"); return field?.value.trim() ? parseMoney(field.value) : null; })(),
+        }))
+        : [];
+      if (selectedVariants.some((variant) => variant._priceInput !== "" && variant.priceCents === null)) throw new Error("Informe um preço válido para cada tamanho.");
+      selectedVariants.forEach((variant) => delete variant._priceInput);
+      let colors = [];
+      let colorVariants = [];
+      if (!productId && state.productColorRows.length) {
+        await Promise.all(state.productColorRows.map((color) => color.imagePromise));
+        colors = state.productColorRows.map((color) => ({
+          name: color.name.trim(),
+          imageData: color.imageData,
+        }));
+        if (colors.some((color) => !color.name || !color.imageData)) {
+          throw new Error("Informe o nome e selecione uma imagem para cada cor.");
+        }
+        if (new Set(colors.map((color) => color.name.toLocaleLowerCase("pt-BR"))).size !== colors.length) {
+          throw new Error("Não repita o nome de uma cor.");
+        }
+        const sizes = productSizesForType(product.sizeType);
+        for (const color of state.productColorRows) {
+          const variants = sizes.length
+            ? sizes.filter((size) => Object.hasOwn(color.quantities, size))
+              .map((size) => ({ size, quantity: Number(color.quantities[size]), price: String(color.prices[size] ?? "").trim() }))
+            : [{ size: null, quantity: Number(color.quantity), price: String(color.price ?? "").trim() }];
+          if (!variants.length) {
+            throw new Error(`Selecione ao menos um tamanho para a cor ${color.name.trim()}.`);
+          }
+          if (variants.some((variant) => variant.price !== "" && parseMoney(variant.price) === null)) {
+            throw new Error(`Informe um preço válido para as variações da cor ${color.name.trim()}.`);
+          }
+          if (variants.some((variant) => !Number.isSafeInteger(variant.quantity)
+            || variant.quantity < 0 || variant.quantity > 2147483647)) {
+            throw new Error(`Informe um estoque inteiro válido para a cor ${color.name.trim()}.`);
+          }
+          colorVariants.push(...variants.map((variant) => ({
+            size: variant.size,
+            quantity: variant.quantity,
+            priceCents: variant.price === "" ? null : parseMoney(variant.price),
+            color: color.name.trim(),
+          })));
+        }
+      }
+      if (!productId) {
+        await state.productImagesPromise;
+        if (!state.productImagesData.length) {
+          throw new Error("Aguarde o processamento e selecione pelo menos uma imagem do produto.");
+        }
+        const imageDataLength = [...state.productImagesData, ...colors.map((color) => color.imageData)]
+          .reduce((total, image) => total + image.length, 0);
+        if (imageDataLength > 1_300_000) {
+          throw new Error("O conjunto das imagens ficou grande demais para sincronizar. Reduza a quantidade ou escolha imagens menores.");
+        }
+      }
+      if (sizeMode && !selectedVariants.length) {
+        throw new Error("Selecione pelo menos um tamanho e informe o estoque correspondente.");
+      }
+      if (!window.confirm("Tem certeza de que está tudo certo com os dados do produto? Confirme para concluir o cadastro.")) return;
+      if (!productId) {
+        product.variants = colors.length ? colorVariants : selectedVariants;
+        if (colors.length) product.colors = colors;
+      }
+      const submittedVariants = colors.length ? colorVariants : selectedVariants;
+      product.quantity = sizeMode || colors.length
+        ? submittedVariants.reduce((total, variant) => total + variant.quantity, 0)
+        : Number(form.elements.quantity.value);
+      if (state.productImageDirty) product.imageData = state.productImageData;
+      if (productId) {
+        await api(`/api/products/${productId}`, { method: "PUT", body: product });
+        showToast("Produto atualizado.");
+      } else {
+        product.branchId = state.branchId;
+        product.images = state.productImagesData;
+        const created = await api("/api/products", { method: "POST", body: product });
+        showToast(`Produto cadastrado · SKU ${created.sku} · código de barras ${created.barcode}.`);
+      }
+      await renderProducts();
+      return;
+    }
+    if (form.id === "promotionForm") {
+      event.preventDefault();
+      const percent = Number(value("discountPercent"));
+      const startsAt = new Date(value("startsAt"));
+      const endsAt = new Date(value("endsAt"));
+      if (!Number.isFinite(percent) || percent <= 0 || percent >= 100) {
+        throw new Error("Informe um desconto entre 0,01% e 99,99%.");
+      }
+      if (!Number.isFinite(startsAt.getTime()) || !Number.isFinite(endsAt.getTime()) || endsAt <= startsAt) {
+        throw new Error("Informe um período de promoção válido.");
+      }
+      await api("/api/promotions", {
+        method: "POST",
+        body: {
+          productId: Number(value("productId")),
+          discountBasisPoints: Math.round(percent * 100),
+          startsAt: startsAt.toISOString(),
+          endsAt: endsAt.toISOString(),
+        },
+      });
+      showToast("Promoção agendada.");
+      await renderPromotions();
+      return;
+    }
+    if (form.id === "customerForm") {
+      event.preventDefault();
+      await api("/api/customers", { method: "POST", body: { name: value("name"), phone: value("phone"), email: value("email") } });
+      showToast("Cliente cadastrado.");
+      await renderCustomers();
+      return;
+    }
+    if (form.id === "openCashForm") {
+      event.preventDefault();
+      const openingCents = parseMoney(value("opening"));
+      if (openingCents === null) throw new Error("Informe um valor válido.");
+      await api("/api/cash/open", { method: "POST", body: { branchId: state.branchId, openingCents } });
+      showToast("Caixa aberto.");
+      await renderCash();
+      return;
+    }
+    if (form.id === "cashMovementForm") {
+      event.preventDefault();
+      const amountCents = parseMoney(value("amount"));
+      if (amountCents === null || amountCents < 1) throw new Error("Informe um valor maior que zero.");
+      await api("/api/cash/movement", {
+        method: "POST",
+        body: { branchId: state.branchId, kind: value("kind"), amountCents, note: value("note") },
+      });
+      showToast("Movimentação registrada.");
+      await renderCash();
+      return;
+    }
+    if (form.id === "closeCashForm") {
+      event.preventDefault();
+      const closingCents = parseMoney(value("closing"));
+      if (closingCents === null) throw new Error("Informe um valor válido.");
+      if (!confirm("Confirma o fechamento do caixa?")) return;
+      const result = await api("/api/cash/close", {
+        method: "POST", body: { branchId: state.branchId, closingCents },
+      });
+      showToast(`Caixa fechado. Diferença: ${formatMoney(result.differenceCents)}.`);
+      await renderCash();
+      return;
+    }
+    if (form.id === "reportForm") {
+      event.preventDefault();
+      $("#reportResults").innerHTML = `<div class="panel report-loading">Gerando relatório mensal completo…</div>`;
+      $("#printMonthlyReport").disabled = true;
+      $("#exportSales").disabled = true;
+      try {
+        await loadReport(value("month"));
+      } catch (error) {
+        $("#reportResults").innerHTML = `<div class="panel report-loading">${escapeHtml(error.message)}</div>`;
+        throw error;
+      }
+      return;
+    }
+    if (form.id === "branchForm") {
+      event.preventDefault();
+      await api("/api/branches", { method: "POST", body: { name: value("name") } });
+      showToast("Unidade cadastrada.");
+      const session = await api("/api/me");
+      state.branches = session.branches;
+      localStorage.removeItem("pdv_branch");
+      await enterApplication(session);
+      await renderSettings();
+      return;
+    }
+    if (form.id === "userForm") {
+      event.preventDefault();
+      await api("/api/users", {
+        method: "POST",
+        body: { name: value("name"), username: value("username"), role: value("role"), password: value("password") },
+      });
+      showToast("Usuário criado.");
+      await renderSettings();
+    }
+  } catch (error) {
+    showToast(error.message, true);
+  }
+}
+
+async function handleClick(event) {
+  const button = event.target.closest("button");
+  if (!button) return;
+  try {
+    if (button.dataset.action === "add-product-color") {
+      if (state.productColorRows.length >= 10) throw new Error("Cadastre no máximo 10 cores por produto.");
+      state.productColorRows.push(makeProductColorRow());
+      updateProductCategoryFields();
+      $(`[data-product-color-name="${state.productColorRows.length - 1}"]`)?.focus();
+      return;
+    }
+    if (button.dataset.action === "remove-product-color") {
+      state.productColorRows.splice(Number(button.dataset.index), 1);
+      updateProductCategoryFields();
+      return;
+    }
+    if (button.id === "addBrandBtn") {
+      const name = await requestText("Cadastrar marca", "Nome da marca", {
+        placeholder: "Ex.: Minha marca",
+        maxLength: 100,
+      });
+      if (!name) return;
+      const brand = await api("/api/brands", { method: "POST", body: { name } });
+      state.brands.push(brand);
+      const brandSelect = $("#brandSelect");
+      brandSelect.add(new Option(brand.name, brand.id));
+      brandSelect.value = String(brand.id);
+      showToast("Marca cadastrada com sucesso.");
+      return;
+    }
+    if (button.id === "addCategoryBtn") {
+      const name = await requestText("Cadastrar categoria", "Nome da categoria", {
+        placeholder: "Ex.: Vestuário",
+        maxLength: 100,
+      });
+      if (!name) return;
+      const category = await api("/api/categories", { method: "POST", body: { name } });
+      state.categories.push(category);
+      const categorySelect = $("#categorySelect");
+      categorySelect.add(new Option(category.name, category.id));
+      categorySelect.value = String(category.id);
+      categorySelect.dispatchEvent(new Event("change", { bubbles: true }));
+      showToast("Categoria cadastrada com sucesso.");
+      return;
+    }
+    if (button.id === "addSubcategoryBtn") {
+      const categoryId = Number($("#categorySelect").value);
+      if (!categoryId) {
+        showToast("Selecione uma categoria primeiro.", true);
+        return;
+      }
+      const name = await requestText("Cadastrar subcategoria", "Nome da subcategoria", {
+        placeholder: "Ex.: Camisetas",
+        maxLength: 100,
+      });
+      if (!name) return;
+      const subcategory = await api("/api/categories", {
+        method: "POST",
+        body: { name, parentId: categoryId },
+      });
+      state.categories.push(subcategory);
+      const subcategorySelect = $("#subcategorySelect");
+      subcategorySelect.add(new Option(subcategory.name, subcategory.id));
+      subcategorySelect.value = String(subcategory.id);
+      updateProductCategoryFields();
+      showToast("Subcategoria cadastrada com sucesso.");
+      return;
+    }
+    if (button.dataset.view) return switchView(button.dataset.view);
+    if (button.id === "openSalesHistory") return await openSalesHistory();
+    if (button.id === "closeSalesHistory") {
+      $("#salesHistoryDialog").close();
+      return;
+    }
+    if (button.dataset.action === "close-payment-dialog") {
+      $("#paymentDialog").close();
+      state.simulationSnapshot = null;
+      return;
+    }
+    if (button.id === "confirmTestPayment") {
+      const simulatedSale = state.simulationSnapshot;
+      if (!simulatedSale) throw new Error("Não há uma compra de teste aberta.");
+      state.simulationSnapshot = null;
+      const dialog = $("#paymentDialog");
+      dialog.close();
+      renderTestReceipt(simulatedSale);
+      clearSaleDraft();
+      openReceiptOffer({ testSale: simulatedSale });
+      await renderSales();
+      return;
+    }
+    if (button.id === "registerSaleNormally") {
+      state.skipTestQrOnce = true;
+      state.simulationSnapshot = null;
+      $("#paymentDialog").close();
+      $("#checkoutButton").click();
+      return;
+    }
+    if (button.id === "printSaleReceipt") {
+      const receiptOffer = state.receiptOffer;
+      $("#paymentDialog").close();
+      state.receiptOffer = null;
+      if (receiptOffer?.testSale) {
+        renderTestReceipt(receiptOffer.testSale);
+        window.print();
+      } else if (receiptOffer?.saleId) {
+        await showReceipt(receiptOffer.saleId);
+      }
+      return;
+    }
+    if (button.id === "skipSaleReceipt") {
+      $("#paymentDialog").close();
+      state.receiptOffer = null;
+      return;
+    }
+    if (button.id === "passwordButton") {
+      $("#passwordDialog").showModal();
+      return;
+    }
+    if (button.id === "downloadBarcodeLabelsPdf") return downloadBarcodeLabelsPdf();
+    if (button.id === "closePasswordDialog") {
+      $("#passwordDialog").close();
+      return;
+    }
+    if (button.id === "closeTransferDialog") {
+      $("#transferDialog").close();
+      return;
+    }
+    const id = Number(button.dataset.id);
+    if (button.dataset.action === "add-product") {
+      return await addProductToCart(id, button.dataset.variantId ? Number(button.dataset.variantId) : null);
+    }
+    if (button.dataset.action === "refresh-site-products") return await renderProducts();
+    if (button.dataset.action === "link-site-product") {
+      const select = $(`[data-site-candidate="${id}"]`);
+      const siteProductId = Number(select?.value);
+      const product = state.products.find((item) => item.id === id);
+      if (!siteProductId || !product) throw new Error("Selecione um produto candidato no site.");
+      if (!confirm(`Vincular "${product.name}" ao produto selecionado no site?\n\nO site passará a usar o SKU ${product.sku} e o código de barras ${product.barcode}.`)) return;
+      await api("/api/site-sync/products/link", {
+        method: "POST",
+        body: { productId: siteProductId, localProductId: id },
+      });
+      showToast(`Produto "${product.name}" vinculado ao site.`);
+      return await renderProducts();
+    }
+    if (button.dataset.action === "qty") return changeCartQuantity(id, Number(button.dataset.change), button.dataset.variantId ? Number(button.dataset.variantId) : null);
+    if (button.dataset.action === "remove-cart") {
+      const variantId = button.dataset.variantId ? Number(button.dataset.variantId) : null;
+      state.cart = state.cart.filter((item) => !(item.id === id && (item.variantId ?? null) === variantId));
+      if (state.selectedProductId === id) state.selectedProductId = state.cart.at(-1)?.id ?? null;
+      return renderSales();
+    }
+    if (button.dataset.action === "clear-cart") {
+      state.cart = [];
+      state.selectedProductId = null;
+      return renderSales();
+    }
+    if (button.dataset.action === "add-payment") {
+      syncPaymentRows();
+      if (state.paymentRows.length >= 5) return;
+      state.paymentRows.forEach((payment) => { payment.autoAmount = false; });
+      state.paymentRows.push({ method: "PIX", amountCents: 0, receivedCents: null, autoAmount: false });
+      $("#paymentRows").innerHTML = renderPaymentRows();
+      updatePaymentBalance();
+      return;
+    }
+    if (button.dataset.action === "remove-payment") {
+      syncPaymentRows();
+      state.paymentRows.splice(Number(button.dataset.index), 1);
+      $("#paymentRows").innerHTML = renderPaymentRows();
+      updatePaymentBalance();
+      return;
+    }
+    if (button.dataset.action === "receipt") return await showReceipt(id);
+    if (button.dataset.action === "cancel-sale") {
+      const reason = await requestText("Cancelar venda", "Motivo do cancelamento", {
+        placeholder: "Descreva o motivo",
+      });
+      if (!reason?.trim()) return;
+      if (!confirm(`Cancelar a venda #${id}?\n\nO estoque será reposto e o valor removido das vendas concluídas. O estorno em dinheiro será registrado como saída do caixa. Confirme estornos de Pix/cartão na operadora.`)) return;
+      const result = await api(`/api/sales/${id}/cancel`, { method: "POST", body: { reason } });
+      const externalRefunds = result.refundByMethod
+        .filter((payment) => payment.method !== "CASH")
+        .map((payment) => `${paymentLabels[payment.method] ?? payment.method}: ${formatMoney(payment.amountCents)}`);
+      const refundNote = externalRefunds.length
+        ? ` Confirme o estorno externo: ${externalRefunds.join(", ")}.`
+        : "";
+      showToast(`Venda #${id} cancelada; estoque restaurado e faturamento ajustado. Saída em dinheiro no caixa: ${formatMoney(result.cashRefundCents)}.${refundNote}`);
+      await renderSales();
+      if ($("#salesHistoryDialog").open) await openSalesHistory();
+      return;
+    }
+    if (button.dataset.action === "edit-product") {
+      const product = state.products.find((item) => item.id === id);
+      const form = $("#productForm");
+      if (!product || !form) return;
+      form.elements.productId.value = product.id;
+      form.elements.name.value = product.name;
+      form.elements.description.value = product.description || "";
+      $("#productDescriptionCount").textContent = `${form.elements.description.value.length}/1000 caracteres`;
+      form.elements.brandId.value = product.brand_id || "";
+      const productCategory = state.categories.find((category) => category.id === product.category_id);
+      $("#productSizeTypeSelect").value = product.size_type || productSizeType(productCategory?.name,
+        productCategory?.parent_id ? state.categories.find((category) => category.id === productCategory.parent_id)?.name : null) || "none";
+      $("#productSizeTypeSelect").disabled = true;
+      form.elements.categoryId.value = productCategory?.parent_id || product.category_id || "";
+      form.elements.price.value = (product.regular_price_cents / 100).toFixed(2);
+      form.elements.cost.value = (product.cost_cents / 100).toFixed(2);
+      form.elements.minStock.value = product.min_stock;
+      form.elements.condition.value = product.condition || "";
+
+      // Carregar subcategorias se categoria estiver selecionada
+      if (product.category_id) {
+        const categoryId = Number(product.category_id);
+        const subcategorySelect = $("#subcategorySelect");
+        if (subcategorySelect) {
+          subcategorySelect.innerHTML = `<option value="">Selecione uma subcategoria</option>`;
+          const subcategories = state.categories.filter(cat => cat.parent_id === categoryId);
+          subcategories.forEach(sub => {
+            subcategorySelect.innerHTML += `<option value="${sub.id}">${escapeHtml(sub.name)}</option>`;
+          });
+          subcategorySelect.disabled = false;
+          subcategorySelect.value = productCategory?.parent_id ? product.category_id : "";
+        }
+      }
+
+      updateProductCategoryFields(product.variants ?? []);
+      renderVariantPriceEditor(product.variants ?? []);
+      state.productImageData = undefined;
+      state.productImagesData = [];
+      state.productImagesPromise = Promise.resolve([]);
+      state.productImageDirty = false;
+      $("#productImageInput").multiple = false;
+      $("#productImageInput").required = !product.has_image;
+      $("#productImageInput").value = "";
+      $("#productImageSelectionHint").textContent = "Ao substituir, só a imagem do PDV será atualizada.";
+      $("#removeProductImage").checked = false;
+      $("#removeProductImageLabel").classList.toggle("hidden", !product.has_image);
+      if (product.has_image) renderProductImagePreview(`/api/products/${product.id}/image`);
+      else clearProductImagePreview();
+      $("#productFormTitle").textContent = `Editar: ${product.name}`;
+      $("#initialQuantityLabel").classList.add("hidden");
+      $("#cancelProductEdit").classList.remove("hidden");
+      form.scrollIntoView({ behavior: "smooth", block: "start" });
+      return;
+    }
+    if (button.dataset.action === "adjust-stock") {
+      const product = state.products.find((item) => item.id === id);
+      const deltaText = await requestText(
+        "Ajustar estoque",
+        `Saldo atual de ${product?.name}: ${product?.quantity}. Informe a alteração (ex.: 5 para entrada ou -2 para saída).`,
+      );
+      if (deltaText === null) return;
+      const delta = Number(deltaText);
+      if (!Number.isSafeInteger(delta) || delta === 0) return showToast("Informe uma quantidade inteira diferente de zero.", true);
+      const note = await requestText("Ajustar estoque", "Motivo do ajuste", {
+        placeholder: "Descreva o motivo",
+      });
+      if (!note?.trim()) return;
+      await api("/api/inventory/adjust", {
+        method: "POST", body: { branchId: state.branchId, productId: id, delta, note: note.trim() },
+      });
+      showToast("Estoque atualizado.");
+      return renderProducts();
+    }
+    if (button.dataset.action === "adjust-size-stock") {
+      const product = state.products.find((item) => item.id === id);
+      const variant = product?.variants?.find((item) => item.id === Number(button.dataset.variantId));
+      if (!product || !variant) throw new Error("Tamanho não encontrado.");
+      const deltaText = await requestText(
+        "Ajustar estoque por tamanho",
+        `Saldo ${variant.color ? `${variant.color} · ` : ""}${variant.size || "sem tamanho"} de ${product.name}: ${variant.quantity}. Informe a alteração (ex.: 5 ou -2).`,
+      );
+      if (deltaText === null) return;
+      const delta = Number(deltaText);
+      if (!Number.isSafeInteger(delta) || delta === 0) return showToast("Informe uma quantidade inteira diferente de zero.", true);
+      const note = await requestText("Ajustar estoque", "Motivo do ajuste", {
+        placeholder: "Descreva o motivo",
+      });
+      if (!note?.trim()) return;
+      await api("/api/inventory/variant-adjust", {
+        method: "POST",
+        body: { branchId: state.branchId, variantId: variant.id, delta, note: note.trim() },
+      });
+      showToast(`Estoque da variação ${variant.color ? `${variant.color} · ` : ""}${variant.size || "sem tamanho"} atualizado.`);
+      return renderProducts();
+    }
+    if (button.dataset.action === "transfer-stock") {
+      const product = state.products.find((item) => item.id === id);
+      const targets = state.branches.filter((branch) => branch.id !== state.branchId);
+      if (!product || !targets.length) return showToast("Cadastre outra unidade para transferir estoque.", true);
+      const form = $("#transferForm");
+      form.elements.productId.value = String(product.id);
+      form.elements.variantId.value = "";
+      form.elements.quantity.value = "";
+      form.elements.note.value = "";
+      $("#transferProductName").textContent = `${product.name} · saldo disponível: ${product.quantity}`;
+      form.elements.targetBranchId.innerHTML = targets.map((branch) =>
+        `<option value="${branch.id}">${escapeHtml(branch.name)}</option>`).join("");
+      $("#transferDialog").showModal();
+      return;
+    }
+    if (button.dataset.action === "transfer-size-stock") {
+      const product = state.products.find((item) => item.id === id);
+      const variant = product?.variants?.find((item) => item.id === Number(button.dataset.variantId));
+      const targets = state.branches.filter((branch) => branch.id !== state.branchId);
+      if (!product || !variant) throw new Error("Tamanho não encontrado.");
+      if (!targets.length) return showToast("Cadastre outra unidade para transferir estoque.", true);
+      const form = $("#transferForm");
+      form.elements.productId.value = String(product.id);
+      form.elements.variantId.value = String(variant.id);
+      $("#transferProductName").textContent = `${product.name} · ${variant.color ? `${variant.color} · ` : ""}${variant.size || "sem tamanho"} · saldo ${variant.quantity}`;
+      form.elements.targetBranchId.innerHTML = targets.map((branch) =>
+        `<option value="${branch.id}">${escapeHtml(branch.name)}</option>`).join("");
+      form.elements.quantity.value = "";
+      form.elements.note.value = "";
+      $("#transferDialog").showModal();
+      return;
+    }
+    if (button.dataset.action === "toggle-user") {
+      const active = button.dataset.active === "true";
+      if (!confirm(`${active ? "Ativar" : "Desativar"} este usuário?`)) return;
+      await api(`/api/users/${id}`, { method: "PATCH", body: { active } });
+      showToast("Acesso atualizado.");
+      return renderSettings();
+    }
+    if (button.dataset.action === "cancel-promotion") {
+      if (!confirm("Encerrar esta promoção?")) return;
+      await api(`/api/promotions/${Number(button.dataset.id)}`, { method: "DELETE", body: {} });
+      showToast("Promoção encerrada.");
+      return renderPromotions();
+    }
+    if (button.dataset.action === "retry-site-sync") {
+      await api("/api/site-sync/retry", { method: "POST", body: {} });
+      showToast("Sincronização solicitada.");
+      return renderPromotions();
+    }
+    if (button.dataset.action === "reconcile-site-stock") {
+      if (!confirm("Isso substituirá no site os saldos e preços pelos valores atuais da Unidade principal do PDV. Confirma após conferir os SKUs e as quantidades?")) return;
+      const result = await api("/api/site-sync/reconcile", { method: "POST", body: {} });
+      showToast(`${result.queued} produto(s) enviados para conciliação de estoque.`);
+      return renderPromotions();
+    }
+    if (button.id === "cancelProductEdit") return resetProductForm();
+    if (button.id === "checkoutButton") {
+      if (!state.cart.length) return;
+      const total = saleTotal();
+      if (total.total < 1) return showToast("O total deve ser maior que zero.", true);
+      syncPaymentRows();
+      if (state.paymentRows.some((payment) => payment.amountCents < 0)
+        || state.paymentRows.reduce((sum, payment) => sum + payment.amountCents, 0) !== total.total) {
+        return showToast("A soma dos pagamentos deve ser igual ao total.", true);
+      }
+      if (state.paymentRows.some((payment) => payment.method === "CASH"
+        && payment.receivedCents !== null && payment.receivedCents < payment.amountCents)) {
+        return showToast("O valor recebido em dinheiro é menor que o pagamento.", true);
+      }
+      if (state.skipTestQrOnce) state.skipTestQrOnce = false;
+      else if (state.paymentRows.some((payment) => payment.method === "PIX")) {
+        button.disabled = true;
+        try {
+          await openPaymentSimulation(makeSimulationSnapshot(total));
+        } finally {
+          if (button.isConnected) button.disabled = false;
+        }
+        return;
+      }
+      button.disabled = true;
+      try {
+        const result = await api("/api/sales", {
+          method: "POST",
+          body: {
+            branchId: state.branchId,
+            customerId: $("#saleCustomer").value || null,
+            discountCents: total.discount,
+            items: state.cart.map((item) => ({
+              productId: item.id,
+              ...(item.variantId ? { variantId: item.variantId } : {}),
+              quantity: item.quantity,
+            })),
+            payments: state.paymentRows.map((payment) => ({
+              method: payment.method,
+              amountCents: payment.amountCents,
+              ...(payment.method === "CASH" && payment.receivedCents !== null
+                ? { receivedCents: payment.receivedCents } : {}),
+            })),
+          },
+        });
+        const cashReceived = state.paymentRows.reduce((sum, payment) =>
+          sum + (payment.method === "CASH" ? (payment.receivedCents ?? payment.amountCents) : 0), 0);
+        const cashPaid = state.paymentRows.reduce((sum, payment) =>
+          sum + (payment.method === "CASH" ? payment.amountCents : 0), 0);
+        clearSaleDraft();
+        const syncNotice = result.siteSyncPending
+          ? " Sincronização do estoque com o site pendente."
+          : "";
+        showToast(`Venda #${result.id} finalizada. Troco: ${formatMoney(cashReceived - cashPaid)}.${syncNotice}`);
+        await renderSales();
+        openReceiptOffer({ saleId: result.id });
+      } finally {
+        if (button.isConnected) button.disabled = false;
+      }
+      return;
+    }
+  } catch (error) {
+    showToast(error.message, true);
+  }
+}
+
+document.addEventListener("submit", handleSubmit);
+document.addEventListener("click", (event) => {
+  handleClick(event).catch((error) => showToast(error.message, true));
+});
+document.addEventListener("focusout", (event) => {
+  if (event.target.form?.id === "productForm" && event.target.name === "name") {
+    event.target.value = normalizeDisplayName(event.target.value);
+  }
+});
+document.addEventListener("change", (event) => {
+  if (!event.target.matches("[data-site-candidate]")) return;
+  const row = event.target.closest("tr");
+  const button = $("[data-action='link-site-product']", row);
+  if (button) button.disabled = !event.target.value;
+});
+$("#branchSelect").addEventListener("change", (event) => {
+  state.branchId = Number(event.target.value);
+  localStorage.setItem("pdv_branch", String(state.branchId));
+  state.cart = [];
+  state.selectedProductId = null;
+  state.searchMatchProductId = null;
+  state.lastAutoAddedCode = null;
+  state.paymentRows = [];
+  state.customerId = "";
+  if ($("#discountInput")) $("#discountInput").value = "0.00";
+  loadView(state.view).catch((error) => showToast(error.message, true));
+});
+$("#logoutButton").addEventListener("click", async () => {
+  try {
+    await api("/api/auth/logout", { method: "POST", body: {} });
+  } catch (error) {
+    showToast(error.message, true);
+  }
+  state.user = null;
+  state.csrf = "";
+  state.cart = [];
+  state.customerId = "";
+  state.paymentRows = [];
+  setAuthMode(false);
+});
+document.addEventListener("input", (event) => {
+  if (event.target.matches?.("[data-size-qty]")) updateProductSizeTotal();
+  if (event.target.matches?.("[data-product-color-name]")) {
+    const color = state.productColorRows[Number(event.target.dataset.productColorName)];
+    if (color) color.name = event.target.value;
+  }
+  if (event.target.matches?.("[data-color-quantity]")) {
+    const [colorIndex, ...sizeParts] = event.target.dataset.colorQuantity.split(":");
+    const color = state.productColorRows[Number(colorIndex)];
+    if (color) {
+      const size = sizeParts.join(":");
+      if (size === "") color.quantity = Number(event.target.value || 0);
+      else color.quantities[size] = Number(event.target.value || 0);
+      updateProductColorTotal();
+    }
+  }
+  if (event.target.matches?.("[data-color-price]")) {
+    const [colorIndex, ...sizeParts] = event.target.dataset.colorPrice.split(":");
+    const color = state.productColorRows[Number(colorIndex)];
+    if (color) {
+      const size = sizeParts.join(":");
+      if (size === "") color.price = event.target.value;
+      else color.prices[size] = event.target.value;
+    }
+  }
+  if (event.target.id === "productDescription") {
+    $("#productDescriptionCount").textContent = `${event.target.value.length}/1000 caracteres`;
+  }
+  if (event.target.id === "labelProductSearch") {
+    const query = normalizeProductSearch(event.target.value);
+    $$("#labelProductList .label-product-row").forEach((row) => {
+      row.classList.toggle("hidden", !normalizeProductSearch(row.dataset.search).includes(query));
+    });
+  }
+  if (event.target.matches("[data-label-copies]")) {
+    const productId = Number(event.target.dataset.labelCopies);
+    let copies = Number(event.target.value);
+    if (!Number.isSafeInteger(copies) || copies < 0) copies = 0;
+    copies = Math.min(copies, MAX_LABEL_COPIES);
+    const otherCopies = Object.entries(state.labelCopies)
+      .filter(([id]) => Number(id) !== productId)
+      .reduce((sum, [, count]) => sum + Number(count), 0);
+    if (copies + otherCopies > MAX_LABEL_COPIES) {
+      copies = Math.max(0, MAX_LABEL_COPIES - otherCopies);
+      showToast(`É possível selecionar no máximo ${MAX_LABEL_COPIES} etiquetas por folha.`, true);
+    }
+    event.target.value = String(copies);
+    state.labelCopies[productId] = copies;
+    updateBarcodePreview();
+  }
+  if (event.target.id === "customLabelWidth" || event.target.id === "customLabelHeight") {
+    updateBarcodePreview();
+  }
+  if (event.target.id === "productSearch") {
+    const query = normalizeProductSearch(event.target.value);
+    if (query !== state.lastAutoAddedCode) state.lastAutoAddedCode = null;
+    const exactVariant = findExactVariantCode(query);
+    if (exactVariant) {
+      state.lastAutoAddedCode = query;
+      addProductToCart(exactVariant.product.id, exactVariant.variant.id)
+        .catch((error) => showToast(error.message, true));
+      return;
+    }
+    const exactCodeProduct = findExactProductCode(query);
+    if (exactCodeProduct) {
+      state.lastAutoAddedCode = query;
+      addProductToCart(exactCodeProduct.id).catch((error) => showToast(error.message, true));
+      return;
+    }
+    const filtered = state.products.filter((product) =>
+      [product.name, product.sku, product.barcode, product.category]
+        .some((value) => normalizeProductSearch(value).includes(query)));
+    const exactProduct = findExactSearchProduct(event.target.value);
+    state.searchMatchProductId = exactProduct?.id ?? null;
+    $("#productResults").innerHTML = renderProductTiles(filtered);
+    updateSaleFocus();
+  }
+  if (event.target.id === "discountInput") updateSaleTotals();
+  if (event.target.id === "inventorySearch") {
+    const query = event.target.value.toLocaleLowerCase("pt-BR");
+    $$("#view-products tbody tr").forEach((row) => {
+      row.classList.toggle("hidden", !row.dataset.search.toLocaleLowerCase("pt-BR").includes(query));
+    });
+  }
+  if (event.target.id === "customerSearch") {
+    const query = event.target.value.toLocaleLowerCase("pt-BR");
+    $$("#view-customers tbody tr").forEach((row) => {
+      row.classList.toggle("hidden", !row.dataset.search.toLocaleLowerCase("pt-BR").includes(query));
+    });
+  }
+});
+document.addEventListener("change", (event) => {
+  if (event.target.id === "saleCustomer") state.customerId = event.target.value;
+  if (event.target.id === "productSizeTypeSelect") {
+    updateProductCategoryFields([]);
+  }
+  if (event.target.id === "categorySelect") {
+    const categoryId = Number(event.target.value);
+    const category = state.categories.find(cat => cat.id === categoryId);
+    const subcategorySelect = $("#subcategorySelect");
+    if (subcategorySelect) {
+      subcategorySelect.innerHTML = `<option value="">Selecione uma subcategoria</option>`;
+      if (categoryId) {
+        const subcategories = state.categories.filter(cat => cat.parent_id === categoryId);
+        subcategories.forEach(sub => {
+          subcategorySelect.innerHTML += `<option value="${sub.id}">${escapeHtml(sub.name)}</option>`;
+        });
+        subcategorySelect.disabled = false;
+      } else {
+        subcategorySelect.disabled = true;
+      }
+    }
+
+    updateProductCategoryFields();
+  }
+  if (event.target.id === "subcategorySelect") updateProductCategoryFields();
+  if (event.target.matches?.("[data-size-check]")) updateProductSizeTotal();
+  if (event.target.matches?.("[data-color-size]")) {
+    const [colorIndex, size] = event.target.dataset.colorSize.split(":");
+    const color = state.productColorRows[Number(colorIndex)];
+    if (color) {
+      if (event.target.checked) {
+        const quantityInput = event.target.closest("[data-color-size-row]").querySelector("[data-color-quantity]");
+        color.quantities[size] = Number(quantityInput.value || 0);
+      } else {
+        delete color.quantities[size];
+      }
+      updateProductCategoryFields();
+    }
+  }
+  if (event.target.matches?.("[data-product-color-image]")) {
+    const index = Number(event.target.dataset.productColorImage);
+    const color = state.productColorRows[index];
+    const file = event.target.files?.[0];
+    if (color && file) {
+      const processing = optimizeProductImage(file).then((imageData) => {
+        color.imageData = imageData;
+        if (state.productColorRows.includes(color)) renderProductColorRows();
+        return imageData;
+      }).catch((error) => {
+        event.target.value = "";
+        color.imageData = null;
+        showToast(error.message, true);
+        renderProductColorRows();
+        return null;
+      });
+      color.imagePromise = processing;
+    }
+  }
+  if (event.target.id === "labelSize") {
+    $("#customLabelSize").classList.toggle("hidden", event.target.value !== "custom");
+    updateBarcodePreview();
+  }
+  if (event.target.id === "labelShowName" || event.target.id === "labelShowPrice") updateBarcodePreview();
+  if (event.target.id === "productImageInput") {
+    const input = event.target;
+    const files = [...(input.files ?? [])];
+    state.productImagesData = [];
+    state.productImagesPromise = Promise.resolve([]);
+    if (!files.length) return;
+    if (files.length > 10) {
+      input.value = "";
+      showToast("Selecione no máximo 10 imagens.", true);
+      return;
+    }
+    const processing = Promise.all(files.map(optimizeProductImage)).then((images) => {
+      if (state.productImagesPromise !== processing) return [];
+      const totalLength = images.reduce((total, image) => total + image.length, 0);
+      if (totalLength > 1_300_000) {
+        throw new Error("O conjunto das imagens ficou grande demais para sincronizar. Reduza a quantidade ou escolha imagens menores.");
+      }
+      state.productImagesData = images;
+      state.productImageData = images[0];
+      state.productImageDirty = true;
+      $("#removeProductImage").checked = false;
+      renderProductImagePreview(images[0]);
+      $("#productImageSelectionHint").textContent = `${images.length} imagem(ns) selecionada(s); o PDV usa a primeira.`;
+      return images;
+    }).catch((error) => {
+      if (state.productImagesPromise === processing) {
+        input.value = "";
+        state.productImagesData = [];
+        state.productImageData = undefined;
+        showToast(error.message, true);
+      }
+      return [];
+    });
+    state.productImagesPromise = processing;
+  }
+  if (event.target.id === "removeProductImage") {
+    state.productImageDirty = true;
+    state.productImageData = event.target.checked ? null : undefined;
+    if (event.target.checked) clearProductImagePreview();
+    else {
+      const productId = Number($("#productForm").elements.productId.value);
+      const product = state.products.find((item) => item.id === productId);
+      if (product?.has_image) renderProductImagePreview(`/api/products/${product.id}/image`);
+      else clearProductImagePreview();
+    }
+  }
+  if (event.target.matches("[data-payment-method]")) {
+    syncPaymentRows();
+    $("#paymentRows").innerHTML = renderPaymentRows();
+    updatePaymentBalance();
+    updateSaleFocus();
+  }
+});
+document.addEventListener("input", (event) => {
+  if (event.target.matches("[data-payment-amount], [data-payment-received]")) {
+    if (event.target.matches("[data-payment-amount]")) {
+      state.paymentRows.forEach((payment) => { payment.autoAmount = false; });
+    }
+    syncPaymentRows();
+    updatePaymentBalance();
+    updateSaleFocus();
+  }
+});
+
+document.addEventListener("keydown", (event) => {
+  if (event.target.id !== "productSearch" || event.key !== "Enter") return;
+  event.preventDefault();
+  const search = normalizeProductSearch(event.target.value);
+  if (!search) return;
+  if (state.lastAutoAddedCode === search) return;
+  const exactProduct = findExactSearchProduct(search);
+  const availableProducts = state.products.filter((product) =>
+    [product.name, product.sku, product.barcode, product.category]
+      .some((value) => normalizeProductSearch(value).includes(search)));
+  const product = exactProduct ?? (availableProducts.length === 1 ? availableProducts[0] : null);
+  if (!product) {
+    showToast("Digite um nome ou código exato, ou refine a busca até encontrar um produto.", true);
+    return;
+  }
+  addProductToCart(product.id).catch((error) => showToast(error.message, true));
+});
+
+initialize();

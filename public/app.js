@@ -1669,6 +1669,10 @@ function resetProductForm() {
   form.elements.images.value = "";
   form.elements.images.required = true;
   $("#productSizeTypeSelect").disabled = false;
+  $("#categorySelect").disabled = false;
+  $("#subcategorySelect").disabled = true;
+  $("#addCategoryBtn").disabled = false;
+  $("#addSubcategoryBtn").disabled = false;
   $("#productImageInput").multiple = true;
   $("#productImageSelectionHint").textContent = "Nenhuma imagem selecionada.";
   $("#removeProductImage").checked = false;
@@ -1917,8 +1921,8 @@ async function handleSubmit(event) {
         name: form.elements.name.value,
         brandId: Number(value("brandId")),
         sizeType: $("#productSizeTypeSelect").value,
-        categoryId: Number(value("categoryId")),
-        subcategoryId: value("subcategoryId") ? Number(value("subcategoryId")) : null,
+        categoryId: Number(form.elements.categoryId.value),
+        subcategoryId: form.elements.subcategoryId.value ? Number(form.elements.subcategoryId.value) : null,
         description: value("description"),
         priceCents, costCents,
         minStock: Number(value("minStock")),
@@ -2319,30 +2323,62 @@ async function handleClick(event) {
       form.elements.description.value = product.description || "";
       $("#productDescriptionCount").textContent = `${form.elements.description.value.length}/1000 caracteres`;
       form.elements.brandId.value = product.brand_id || "";
-      const productCategory = state.categories.find((category) => category.id === product.category_id);
-      $("#productSizeTypeSelect").value = product.size_type || productSizeType(productCategory?.name,
-        productCategory?.parent_id ? state.categories.find((category) => category.id === productCategory.parent_id)?.name : null) || "none";
+      const productCategory = state.categories.find(
+        category => Number(category.id) === Number(product.category_id)
+      );
+
+      const hasSubcategory = product.category_parent_id !== null
+        && product.category_parent_id !== undefined;
+
+      const parentCategoryId = hasSubcategory
+        ? Number(product.category_parent_id)
+        : Number(product.category_id);
+
+      $("#productSizeTypeSelect").value =
+        product.size_type ||
+        productSizeType(productCategory?.name, product.parent_category_name) ||
+        "none";
+
       $("#productSizeTypeSelect").disabled = true;
-      form.elements.categoryId.value = productCategory?.parent_id || product.category_id || "";
-      form.elements.price.value = (product.regular_price_cents / 100).toFixed(2);
-      form.elements.cost.value = (product.cost_cents / 100).toFixed(2);
-      form.elements.minStock.value = product.min_stock;
+      form.elements.categoryId.value = parentCategoryId;
+      $("#categorySelect").disabled = true;
+
+      form.elements.price.value =
+        Number.isFinite(Number(product.regular_price_cents))
+          ? (Number(product.regular_price_cents) / 100).toFixed(2)
+          : "";
+
+      form.elements.cost.value =
+        Number.isFinite(Number(product.cost_cents))
+          ? (Number(product.cost_cents) / 100).toFixed(2)
+          : "";
+
+      form.elements.minStock.value = product.min_stock ?? 0;
       form.elements.condition.value = product.condition || "";
 
-      // Carregar subcategorias se categoria estiver selecionada
-      if (product.category_id) {
-        const categoryId = Number(product.category_id);
-        const subcategorySelect = $("#subcategorySelect");
-        if (subcategorySelect) {
-          subcategorySelect.innerHTML = `<option value="">Selecione uma subcategoria</option>`;
-          const subcategories = state.categories.filter(cat => cat.parent_id === categoryId);
-          subcategories.forEach(sub => {
-            subcategorySelect.innerHTML += `<option value="${sub.id}">${escapeHtml(sub.name)}</option>`;
-          });
-          subcategorySelect.disabled = false;
-          subcategorySelect.value = productCategory?.parent_id ? product.category_id : "";
-        }
+      const subcategorySelect = $("#subcategorySelect");
+
+      if (subcategorySelect) {
+        subcategorySelect.innerHTML = "<option value=\"\">Selecione uma subcategoria</option>";
+
+        const subcategories = state.categories.filter(
+          category => Number(category.parent_id) === parentCategoryId
+        );
+
+        subcategories.forEach(subcategory => {
+          subcategorySelect.innerHTML +=
+            "<option value=\"" + subcategory.id + "\">" +
+            escapeHtml(subcategory.name) + "</option>";
+        });
+
+        subcategorySelect.disabled = subcategories.length === 0;
+        subcategorySelect.value = hasSubcategory
+          ? String(product.category_id)
+          : "";
+        subcategorySelect.disabled = true;
       }
+      $("#addCategoryBtn").disabled = true;
+      $("#addSubcategoryBtn").disabled = true;
 
       updateProductCategoryFields(product.variants ?? []);
       renderVariantPriceEditor(product.variants ?? []);
@@ -2670,7 +2706,7 @@ document.addEventListener("change", (event) => {
     if (subcategorySelect) {
       subcategorySelect.innerHTML = `<option value="">Selecione uma subcategoria</option>`;
       if (categoryId) {
-        const subcategories = state.categories.filter(cat => cat.parent_id === categoryId);
+        const subcategories = state.categories.filter(cat => Number(cat.parent_id) === categoryId);
         subcategories.forEach(sub => {
           subcategorySelect.innerHTML += `<option value="${sub.id}">${escapeHtml(sub.name)}</option>`;
         });

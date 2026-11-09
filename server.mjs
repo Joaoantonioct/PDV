@@ -1437,7 +1437,7 @@ function createApplication({
       branchOrThrow(branchId);
       const query = `%${(url.searchParams.get("q") ?? "").trim().slice(0, 80)}%`;
       const products = db.prepare(`
-        SELECT p.id, p.name, p.description, p.sku, p.barcode, p.category, p.size_type, p.brand_id, p.category_id,
+        SELECT p.id, p.name, p.description, p.sku, p.barcode, p.category, p.size_type, p.brand_id, p.category_id, p.cost_cents, p.condition, c.parent_id AS category_parent_id, pc.name AS parent_category_name,
           b.name AS brand_name, c.name AS category_name,
           p.price_cents AS regular_price_cents,
           COALESCE(ROUND(p.price_cents * (10000 - pr.discount_basis_points) / 10000.0), p.price_cents) AS price_cents,
@@ -1447,6 +1447,7 @@ function createApplication({
         JOIN inventory i ON i.product_id = p.id AND i.branch_id = ?
         LEFT JOIN brands b ON b.id = p.brand_id
         LEFT JOIN categories c ON c.id = p.category_id
+        LEFT JOIN categories pc ON pc.id = c.parent_id
         LEFT JOIN promotions pr ON pr.product_id = p.id
           AND julianday(pr.starts_at) <= julianday('now') AND julianday(pr.ends_at) > julianday('now')
         WHERE p.active = 1 AND (p.name LIKE ? OR COALESCE(p.sku, '') LIKE ?
