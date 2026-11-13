@@ -1105,6 +1105,31 @@ function createApplication({
       return sendJson(response, 200, { received: true, ...imported });
     }
 
+    if (method === "POST" && path === "/api/publications") {
+      requireRole(user, ["ADMIN", "MANAGER"]);
+      if (!siteSyncUrl) throw new HttpError(409, "Configure a integração com o site para publicar.");
+      const eventId = requiredText(body.eventId, "Identificador da publicação", 36);
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(eventId)) {
+        throw new HttpError(400, "Identificador da publicação inválido.");
+      }
+      const title = requiredText(body.title, "Título da publicação", 160);
+      const description = optionalText(body.description, "Descrição", 1000);
+      const productSkus = body.productSkus;
+      if (!Array.isArray(productSkus) || productSkus.length < 1 || productSkus.length > 8
+        || productSkus.some((sku) => typeof sku !== "string" || !sku.trim() || sku.length > 100)
+        || new Set(productSkus.map((sku) => sku.toLocaleLowerCase("pt-BR"))).size !== productSkus.length) {
+        throw new HttpError(400, "Selecione de 1 a 8 produtos diferentes para a publicação.");
+      }
+      const publication = await requestSiteApi("publications", {
+        method: "POST",
+        body: { eventId, title, description, productSkus },
+      });
+      if (publication.received !== true || !Number.isSafeInteger(publication.publicationId)) {
+        throw new HttpError(502, "O site não confirmou o registro da publicação.");
+      }
+      return sendJson(response, publication.duplicate ? 200 : 201, publication);
+    }
+
     if (method === "GET" && path === "/api/status") {
       return sendJson(response, 200, {
         setupRequired: !db.prepare("SELECT 1 FROM users LIMIT 1").get(),

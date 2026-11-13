@@ -211,11 +211,15 @@ if (!app.requestSingleInstanceLock()) {
 
     const { createApplication } = await import(pathToFileURL(join(projectRoot, "server.mjs")).href);
     server = createApplication({ dbPath: databasePath });
+    const port = Number(process.env.PORT ?? 3000);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      throw new Error("PORT deve ser um número inteiro entre 1 e 65535.");
+    }
     await new Promise((resolveListen, rejectListen) => {
       server.once("error", rejectListen);
-      server.listen(0, "127.0.0.1", resolveListen);
+      server.listen(port, "0.0.0.0", resolveListen);
     });
-    serverUrl = `http://127.0.0.1:${server.address().port}`;
+    serverUrl = `http://127.0.0.1:${port}`;
     backupDatabase(server.database, backupDirectory, null);
     backupTimer = setInterval(
       () => backupDatabase(server.database, backupDirectory, mainWindow),

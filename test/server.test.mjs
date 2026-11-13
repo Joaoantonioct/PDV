@@ -10,6 +10,7 @@ import { createApplication } from "../server.mjs";
 
 test("configuração, autenticação, venda, estoque, cancelamento e fechamento do caixa", async (context) => {
   let nextIdentifier = 0;
+  let publishedPayload = null;
   const site = createServer(async (request, response) => {
     let data = "";
     request.setEncoding("utf8");
@@ -27,6 +28,11 @@ test("configuração, autenticação, venda, estoque, cancelamento e fechamento 
       }));
     }
     if (request.url === "/api/pdv/products/pending") return response.end(JSON.stringify([]));
+    if (request.url === "/api/pdv/publications") {
+      publishedPayload = body;
+      response.statusCode = 201;
+      return response.end(JSON.stringify({ received: true, duplicate: false, publicationId: 7 }));
+    }
     response.end(JSON.stringify({ received: true, eventId: body.eventId }));
   });
   await new Promise((resolve) => site.listen(0, "127.0.0.1", resolve));
@@ -154,6 +160,30 @@ test("configuração, autenticação, venda, estoque, cancelamento e fechamento 
   assert.equal(server.database.prepare("SELECT description FROM products WHERE id = ?").get(product.payload.id).description, productDescription);
   const productList = await request("/api/products?branchId=1");
   assert.equal(productList.payload.find((item) => item.id === product.payload.id).description, productDescription);
+  const publicationEventId = "f31f1e7a-d7d5-47a2-9fd8-6530a552a5ef";
+  const publication = await request("/api/publications", {
+    method: "POST",
+    body: {
+      eventId: publicationEventId,
+      title: "Look da semana",
+      description: "Camiseta para combinar",
+      productSkus: [product.payload.sku],
+    },
+  });
+  assert.equal(publication.response.status, 201);
+  assert.equal(publication.payload.publicationId, 7);
+  assert.equal(publishedPayload.eventId, publicationEventId);
+  assert.deepEqual(publishedPayload.productSkus, [product.payload.sku]);
+  const deniedPublication = await request("/api/publications", {
+    method: "POST",
+    authenticated: false,
+    body: {
+      eventId: "f31f1e7a-d7d5-47a2-9fd8-6530a552a5ef",
+      title: "Sem sessão",
+      productSkus: [product.payload.sku],
+    },
+  });
+  assert.equal(deniedPublication.response.status, 401);
   const incompleteProduct = await request("/api/products", {
     method: "POST",
     body: { branchId: 1, name: "Produto incompleto", priceCents: 500 },

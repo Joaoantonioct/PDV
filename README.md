@@ -9,7 +9,7 @@ Sistema de ponto de venda em português, com interface web e banco SQLite persis
 
 ## Aplicativo desktop para Windows
 
-O PDV também pode ser executado em uma janela própria, sem abrir o navegador ou iniciar o servidor manualmente. A versão desktop inclui o servidor local e o SQLite, e foi projetada para uso em um único computador de caixa; ela não substitui o servidor central usado por vários computadores na rede.
+O PDV também pode ser executado em uma janela própria, sem abrir o navegador ou iniciar o servidor manualmente. A versão desktop inclui o servidor local e o SQLite. A API fica disponível na porta `3000` para o aplicativo móvel; o acesso remoto deve ser restrito pelo firewall do Windows à VPN privada utilizada. A interface do PDV continua aberta apenas na janela desktop.
 
 Para executar em desenvolvimento, instale as dependências e inicie o aplicativo:
 
@@ -24,7 +24,7 @@ Para gerar o instalador do Windows (64 bits), execute:
 npm run desktop:dist
 ```
 
-O instalador será criado na pasta `release`. O computador de destino não precisa ter Node.js. Na primeira execução, é possível selecionar um banco SQLite existente para importá-lo; a importação cria uma cópia e preserva o arquivo original. No modo de desenvolvimento, o banco em `data/pdv.sqlite` é copiado automaticamente quando ainda não existe uma base desktop.
+O instalador será criado na pasta `release`. O computador de destino não precisa ter Node.js. Na primeira execução, é possível selecionar um banco SQLite existente para importá-lo; a importação cria uma cópia e preserva o arquivo original. No modo de desenvolvimento, o banco em `data/pdv.sqlite` é copiado automaticamente quando ainda não existe uma base desktop. A versão desktop escuta na porta `3000`; defina `PORT` no arquivo `.env` se essa porta já estiver ocupada e atualize a regra correspondente no firewall.
 
 O banco desktop e seus backups ficam em `%APPDATA%\PontoCerto PDV`. O aplicativo cria até sete backups diários automáticos; mantenha cópias adicionais em outro dispositivo ou local seguro. No menu **Ajuda**, use **Abrir pasta de dados e backups** para acessá-los. Para habilitar a sincronização com o site na versão instalada, configure URL, token e unidade no arquivo `.env` aberto pelo menu **Ajuda > Abrir configuração de sincronização** e reinicie o aplicativo. Sem configuração do site, as vendas continuam locais, mas não serão sincronizadas. O instalador ainda não possui assinatura digital; o Windows pode exibir um aviso de segurança ao executá-lo.
 
