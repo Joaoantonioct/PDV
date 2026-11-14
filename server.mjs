@@ -1114,6 +1114,9 @@ function createApplication({
       }
       const title = requiredText(body.title, "Título da publicação", 160);
       const description = optionalText(body.description, "Descrição", 1000);
+      const imageData = requiredText(body.imageData, "Foto da publicação", 1_400_000);
+      const durationHours = body.durationHours;
+      if (!Number.isSafeInteger(durationHours) || durationHours < 1 || durationHours > 8783) throw new HttpError(400, "Duracao da publicacao invalida.");
       const productSkus = body.productSkus;
       if (!Array.isArray(productSkus) || productSkus.length < 1 || productSkus.length > 8
         || productSkus.some((sku) => typeof sku !== "string" || !sku.trim() || sku.length > 100)
@@ -1122,7 +1125,7 @@ function createApplication({
       }
       const publication = await requestSiteApi("publications", {
         method: "POST",
-        body: { eventId, title, description, productSkus },
+        body: { eventId, title, description, productSkus, durationHours, imageData },
       });
       if (publication.received !== true || !Number.isSafeInteger(publication.publicationId)) {
         throw new HttpError(502, "O site não confirmou o registro da publicação.");

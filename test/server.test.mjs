@@ -168,12 +168,15 @@ test("configuração, autenticação, venda, estoque, cancelamento e fechamento 
       title: "Look da semana",
       description: "Camiseta para combinar",
       productSkus: [product.payload.sku],
+      durationHours: 24,
+      imageData: "data:image/jpeg;base64,/9j/AA==",
     },
   });
   assert.equal(publication.response.status, 201);
   assert.equal(publication.payload.publicationId, 7);
   assert.equal(publishedPayload.eventId, publicationEventId);
   assert.deepEqual(publishedPayload.productSkus, [product.payload.sku]);
+  assert.equal(publishedPayload.imageData, "data:image/jpeg;base64,/9j/AA==");
   const deniedPublication = await request("/api/publications", {
     method: "POST",
     authenticated: false,
